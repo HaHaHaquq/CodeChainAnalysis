@@ -149,39 +149,63 @@ export const OpenProjectModal: React.FC = () => {
             <div className="text-[11px] font-semibold text-slate-400 mb-2">
               快速一键切换：
             </div>
-            <div className="grid grid-cols-2 gap-2.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setInputPath("D:\\3-code\\USB\\CherryUSB-1.6.1");
-                  loadLocalProject("D:\\3-code\\USB\\CherryUSB-1.6.1");
-                }}
-                className="flex items-start gap-2.5 rounded-xl border border-cyan-500/35 bg-cyan-500/10 p-3 text-left hover:bg-cyan-500/20 transition-colors"
-              >
-                <HardDrive className="h-4 w-4 text-cyan-400 shrink-0 mt-0.5" />
-                <div>
-                  <div className="text-xs font-bold text-cyan-200">
-                    CherryUSB-1.6.1 (真实本地库)
+            <div className="grid grid-cols-1 gap-2">
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const p = "D:\\3-code\\USB\\CherryUSB-1.6.1";
+                    setInputPath(p);
+                    loadLocalProject(p);
+                  }}
+                  className="flex items-start gap-2.5 rounded-xl border border-cyan-500/35 bg-cyan-500/10 p-2.5 text-left hover:bg-cyan-500/20 transition-colors"
+                >
+                  <HardDrive className="h-4 w-4 text-cyan-400 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-cyan-200 truncate">
+                      CherryUSB-1.6.1 (协议栈库)
+                    </div>
+                    <div className="mt-0.5 font-mono text-[10px] text-slate-400 truncate">
+                      D:\3-code\USB\CherryUSB-1.6.1
+                    </div>
                   </div>
-                  <div className="mt-0.5 font-mono text-[10px] text-slate-400">
-                    D:\3-code\USB\CherryUSB-1.6.1
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const p =
+                      "D:\\3-code\\Git_repo\\A47\\OTFDEC\\TEMP\\stm32cubeh7-v1-13-0\\STM32Cube_FW_H7_V1.13.0\\Projects\\STM32H735G-DK\\Examples\\CRYP\\CRYP_AES_GCM";
+                    setInputPath(p);
+                    loadLocalProject(p);
+                  }}
+                  className="flex items-start gap-2.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-2.5 text-left hover:bg-emerald-500/20 transition-colors"
+                >
+                  <HardDrive className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <div className="text-xs font-bold text-emerald-200 truncate">
+                      STM32H7 CRYP_AES_GCM (Keil工程)
+                    </div>
+                    <div className="mt-0.5 font-mono text-[10px] text-slate-400 truncate">
+                      ...\Examples\CRYP\CRYP_AES_GCM
+                    </div>
                   </div>
-                </div>
-              </button>
+                </button>
+              </div>
 
               <button
                 type="button"
                 onClick={loadBuiltinDemo}
-                className="flex items-start gap-2.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3 text-left hover:bg-indigo-500/20 transition-colors"
+                className="flex items-center gap-2.5 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-left hover:bg-indigo-500/20 transition-colors"
               >
-                <Sparkles className="h-4 w-4 text-indigo-400 shrink-0 mt-0.5" />
+                <Sparkles className="h-4 w-4 text-indigo-400 shrink-0" />
                 <div>
-                  <div className="text-xs font-bold text-indigo-200">
-                    STM32F4 Ymodem + FOC (内置)
-                  </div>
-                  <div className="mt-0.5 text-[10px] text-slate-400">
+                  <span className="text-xs font-bold text-indigo-200">
+                    STM32F4 Ymodem + FOC (内置演示)
+                  </span>
+                  <span className="ml-2 text-[10px] text-slate-400">
                     含 1328B 大数组爆栈与 AT 递归演示
-                  </div>
+                  </span>
                 </div>
               </button>
             </div>

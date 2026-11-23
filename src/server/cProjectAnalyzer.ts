@@ -105,6 +105,12 @@ const TYPE_SIZE_MAP: Record<string, number> = {
   video_payload_header: 12,
 };
 
+interface InlinePhase {
+  title: string;
+  calls: string[];
+  configs: string[];
+}
+
 interface ParsedFileFunc {
   name: string;
   signature: string;
@@ -113,6 +119,10 @@ interface ParsedFileFunc {
   lineEnd: number;
   isWeak: boolean;
   isStatic: boolean;
+  isUserSrc: boolean;
+  docBrief?: string;
+  inlinePhases: InlinePhase[];
+  configAssignments: string[];
   body: string;
   snippet: string;
   hasSwitch: boolean;
@@ -125,6 +135,162 @@ interface ParsedFileFunc {
   directCalls: { callee: string; line: number; argsText: string }[];
   fieldAssignments: { field: string; targetFn: string; line: number }[];
   fieldCalls: { field: string; line: number }[];
+}
+
+const TRIVIAL_STD_CALLS = new Set([
+  "memcpy",
+  "memset",
+  "memcmp",
+  "memmove",
+  "strlen",
+  "strcmp",
+  "strncmp",
+  "strcpy",
+  "strncpy",
+  "snprintf",
+  "sprintf",
+  "printf",
+  "strtol",
+  "strchr",
+  "MIN",
+  "MAX",
+  "LO_BYTE",
+  "HI_BYTE",
+  "assert_param",
+  "UNUSED",
+  "ARG_UNUSED",
+  "USB_LOG_DBG",
+  "USB_LOG_INFO",
+  "USB_LOG_WRN",
+  "USB_LOG_ERR",
+  "USB_LOG_RAW",
+  "USB_ASSERT",
+  "USB_ASSERT_MSG",
+]);
+
+function isSyscallBoilerplate(relFile: string, fnName = ""): boolean {
+  const lowF = relFile.toLowerCase();
+  if (lowF.endsWith("syscalls.c") || lowF.endsWith("sysmem.c")) return true;
+  return [
+    "_exit",
+    "_sbrk",
+    "_write",
+    "_read",
+    "_close",
+    "_fstat",
+    "_isatty",
+    "_lseek",
+    "_kill",
+    "_getpid",
+    "__io_putchar",
+    "__io_getchar",
+  ].includes(fnName);
+}
+
+function extractPrecedingDocBrief(
+  lines: string[],
+  fnStartIdx: number
+): string | undefined {
+  let idx = fnStartIdx;
+  const commentLines: string[] = [];
+  let inBlock = false;
+
+  while (idx > 0 && fnStartIdx - idx <= 35) {
+    idx--;
+    const t = lines[idx].trim();
+    if (!t) {
+      if (commentLines.length > 0 && !inBlock) break;
+      continue;
+    }
+    if (t.endsWith("*/")) inBlock = true;
+    if (inBlock) {
+      const cleaned = t
+        .replace(/^\/\*+/, "")
+        .replace(/\*+\/$/, "")
+        .replace(/^\*+/, "")
+        .trim();
+      if (cleaned && !/^[-*=]+$/.test(cleaned)) {
+        commentLines.push(cleaned);
+      }
+      if (t.startsWith("/*")) break;
+    } else if (t.startsWith("//")) {
+      const cleaned = t.replace(/^\/+/, "").trim();
+      if (cleaned) commentLines.push(cleaned);
+    } else {
+      break;
+    }
+  }
+
+  if (commentLines.length === 0) return undefined;
+  commentLines.reverse();
+
+  const briefParts: string[] = [];
+  let collecting = false;
+  for (const l of commentLines) {
+    const bIdx = l.indexOf("@brief");
+    if (bIdx >= 0) {
+      collecting = true;
+      const rest = l.slice(bIdx + 6).trim();
+      if (rest) briefParts.push(rest);
+    } else if (collecting) {
+      if (l.startsWith("@") || l.startsWith("This software")) break;
+      briefParts.push(l);
+      if (briefParts.length >= 3) break;
+    }
+  }
+
+  const raw =
+    briefParts.length > 0
+      ? briefParts.join(" ")
+      : commentLines
+          .filter((l) => !l.startsWith("@") && !l.includes("Copyright"))
+          .slice(0, 2)
+          .join(" ");
+  const compact = raw.replace(/\s+/g, " ").trim();
+  return compact || undefined;
+}
+
+function synthesizeMeaningfulBrief(
+  pf: ParsedFileFunc,
+  layer: ArchLayer
+): string {
+  const parts: string[] = [];
+  if (
+    pf.docBrief &&
+    pf.docBrief.toLowerCase() !== "main program" &&
+    pf.docBrief.toLowerCase() !== "hal msp module."
+  ) {
+    parts.push(
+      pf.docBrief.length > 88 ? pf.docBrief.slice(0, 86) + "…" : pf.docBrief
+    );
+  }
+  if (pf.inlinePhases.length > 0) {
+    parts.push(
+      `流程阶段: ${pf.inlinePhases
+        .slice(0, 4)
+        .map((p) => p.title)
+        .join(" ➔ ")}`
+    );
+  }
+  if (pf.configAssignments.length > 0 && parts.length < 2) {
+    parts.push(`配置: ${pf.configAssignments.slice(0, 3).join(", ")}`);
+  }
+  if (parts.length === 0) {
+    const keyCalls = pf.directCalls
+      .map((c) => c.callee)
+      .filter((c) => !TRIVIAL_STD_CALLS.has(c) && c !== "Error_Handler")
+      .slice(0, 4);
+    if (keyCalls.length > 0) {
+      parts.push(`调用 ${keyCalls.join(" / ")}`);
+    }
+  }
+  if (parts.length === 0) {
+    if (pf.switchCases.length > 0) {
+      return `状态机分支 (${pf.switchCases.slice(0, 3).join(", ")}) — ${pf.file}:${pf.lineStart}`;
+    }
+    return `${pf.signature} (${layer} 层实现，位于 ${pf.file}:${pf.lineStart})`;
+  }
+  return parts.join(" | ");
 }
 
 function normalizeRelPath(rootDir: string, fullPath: string): string {
@@ -140,15 +306,34 @@ function classifyLayerByFileAndName(
   const lowName = fnName.toLowerCase();
 
   if (
+    lowName.endsWith("mspinit") ||
+    lowName.endsWith("mspdeinit") ||
+    lowName.includes("callback") ||
+    lowName.endsWith("_cb") ||
+    lowName.includes("_event_") ||
+    lowName.includes("_notify_") ||
+    lowName.endsWith("_request_handler") ||
+    lowName.endsWith("_bulk_out") ||
+    lowName.endsWith("_bulk_in")
+  ) {
+    return "CALLBACK";
+  }
+
+  if (
     lowFile.startsWith("port/") ||
     lowFile.startsWith("osal/") ||
     lowFile.startsWith("platform/") ||
     lowFile.startsWith("drivers/") ||
+    lowFile.includes("hal_driver/") ||
+    lowFile.includes("/bsp/") ||
     lowName.startsWith("usb_dc_") ||
     lowName.startsWith("usb_hc_") ||
     lowName.startsWith("usb_osal_") ||
     lowName.startsWith("hal_") ||
+    lowName.startsWith("__hal_") ||
+    lowName.startsWith("ll_") ||
     lowName.startsWith("bsp_") ||
+    lowName.startsWith("scb_") ||
     lowName.endsWith("_irqhandler") ||
     lowName.startsWith("fsdev_") ||
     lowName.startsWith("dwc2_") ||
@@ -163,16 +348,7 @@ function classifyLayerByFileAndName(
     return "HAL";
   }
 
-  if (
-    isWeak ||
-    lowName.includes("callback") ||
-    lowName.endsWith("_cb") ||
-    lowName.includes("_event_") ||
-    lowName.includes("_notify_") ||
-    lowName.endsWith("_request_handler") ||
-    lowName.endsWith("_bulk_out") ||
-    lowName.endsWith("_bulk_in")
-  ) {
+  if (isWeak) {
     return "CALLBACK";
   }
 
@@ -181,7 +357,8 @@ function classifyLayerByFileAndName(
     lowFile.startsWith("app/") ||
     lowFile.startsWith("tests/") ||
     lowName === "main" ||
-    lowName === "lsusb"
+    lowName === "lsusb" ||
+    lowName === "error_handler"
   ) {
     return "APP";
   }
@@ -287,7 +464,8 @@ function analyzeFunctionStack(
 function parseCFileFunctions(
   relFile: string,
   content: string,
-  macros: Record<string, number>
+  macros: Record<string, number>,
+  isUserSrc = true
 ): ParsedFileFunc[] {
   const lines = content.split(/\r?\n/);
   const results: ParsedFileFunc[] = [];
@@ -335,8 +513,13 @@ function parseCFileFunctions(
 
       for (let k = i; k < lines.length; k++) {
         const l = lines[k];
-        for (let c = 0; c < l.length; c++) {
-          const ch = l[c];
+        const t = l.trim();
+        if (t.startsWith("*") || t.startsWith("//") || t.startsWith("/*")) {
+          continue;
+        }
+        const codePart = l.replace(/\/\/.*$/, "").replace(/\/\*.*?\*\//g, "");
+        for (let c = 0; c < codePart.length; c++) {
+          const ch = codePart[c];
           if (ch === "{") {
             depth++;
             started = true;
@@ -353,20 +536,16 @@ function parseCFileFunctions(
 
       if (!started || endLineIdx <= i) continue;
 
+      const docBrief = extractPrecedingDocBrief(lines, i);
       const bodyLines = lines.slice(braceLineIdx + 1, endLineIdx);
       const body = bodyLines.join("\n");
 
       const cleanSnippetLines = bodyLines
         .filter((l) => {
           const t = l.trim();
-          return (
-            t.length > 0 &&
-            !t.startsWith("//") &&
-            !t.startsWith("/*") &&
-            !t.startsWith("*")
-          );
+          return t.length > 0 && t !== "{" && t !== "}";
         })
-        .slice(0, 11);
+        .slice(0, 14);
       const snippet = cleanSnippetLines.join("\n") || beforeBrace;
 
       const isWeak =
@@ -398,13 +577,74 @@ function parseCFileFunctions(
         line: number;
       }[] = [];
       const fieldCalls: { field: string; line: number }[] = [];
+      const configAssignments: string[] = [];
+      const inlinePhases: InlinePhase[] = [];
       const seenCallees = new Set<string>();
       const seenFieldCalls = new Set<string>();
       const heapApis: string[] = [];
+      let inMultilineComment = false;
 
       bodyLines.forEach((bLine, offset) => {
-        const clean = bLine.replace(/\/\/.*$/, "");
         const lineNum = braceLineIdx + 2 + offset;
+
+        if (isUserSrc) {
+          const cmtMatch = bLine.match(/\/\*+\s*(.*?)\s*\*+\//);
+          if (cmtMatch) {
+            const rawC = cmtMatch[1].replace(/^[#-]+|[#-]+$/g, "").trim();
+            if (
+              rawC.length >= 6 &&
+              rawC.toLowerCase() !== "infinite loop" &&
+              !rawC.includes("Error") &&
+              !rawC.startsWith("Set the") &&
+              !rawC.startsWith("Compare results")
+            ) {
+              if (
+                bLine.includes("##-") ||
+                inlinePhases.length === 0 ||
+                /^(Configure|Enable|Compute|Initialize)/i.test(rawC)
+              ) {
+                inlinePhases.push({
+                  title: rawC,
+                  calls: [],
+                  configs: [],
+                });
+              }
+            }
+          }
+        }
+
+        const trimmedB = bLine.trim();
+        if (inMultilineComment) {
+          if (trimmedB.includes("*/")) {
+            inMultilineComment = false;
+          }
+          return;
+        }
+        if (trimmedB.startsWith("/*")) {
+          if (!trimmedB.includes("*/")) {
+            inMultilineComment = true;
+          }
+          return;
+        }
+
+        const clean = bLine.replace(/\/\/.*$/, "").replace(/\/\*.*$/, "");
+
+        if (isUserSrc) {
+          const cfgMatch = clean.match(
+            /([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*|->[a-zA-Z_]\w*)+)\s*=\s*([A-Za-z0-9_]+)\s*;/
+          );
+          if (cfgMatch) {
+            const shortLhs = cfgMatch[1].split(/[.>]/).pop() || cfgMatch[1];
+            const item = `${shortLhs}=${cfgMatch[2]}`;
+            if (configAssignments.length < 8 && !configAssignments.includes(item)) {
+              configAssignments.push(item);
+            }
+            if (inlinePhases.length > 0) {
+              const lastP = inlinePhases[inlinePhases.length - 1];
+              if (lastP.configs.length < 5) lastP.configs.push(item);
+            }
+          }
+        }
 
         // Detect struct function pointer assignments: e.g. intf->class_interface_handler = xxx_handler;
         const assignMatch = clean.match(
@@ -429,12 +669,13 @@ function parseCFileFunctions(
           }
         }
 
-        const callRegex = /\b([a-zA-Z_]\w*)\s*\(([^)]*)\)/g;
+        const callRegex = /\b([a-zA-Z_]\w*)\s*\(/g;
         let m: RegExpExecArray | null;
         while ((m = callRegex.exec(clean)) !== null) {
           const callee = m[1];
-          const argsText = m[2] || "";
           if (C_KEYWORDS.has(callee)) continue;
+          const afterParen = clean.slice(m.index + m[0].length);
+          const argsText = afterParen.split(")")[0] || "";
           if (HEAP_APIS.has(callee) && !heapApis.includes(callee)) {
             heapApis.push(callee);
           }
@@ -445,6 +686,14 @@ function parseCFileFunctions(
               line: lineNum,
               argsText,
             });
+          }
+          if (
+            inlinePhases.length > 0 &&
+            !TRIVIAL_STD_CALLS.has(callee) &&
+            callee !== "Error_Handler"
+          ) {
+            const lastP = inlinePhases[inlinePhases.length - 1];
+            if (!lastP.calls.includes(callee)) lastP.calls.push(callee);
           }
         }
       });
@@ -457,6 +706,10 @@ function parseCFileFunctions(
         lineEnd: endLineIdx + 1,
         isWeak,
         isStatic,
+        isUserSrc,
+        docBrief,
+        inlinePhases,
+        configAssignments,
         body,
         snippet,
         hasSwitch,
@@ -478,6 +731,179 @@ function parseCFileFunctions(
   return results;
 }
 
+function discoverIdeProjectLinkedFiles(
+  rootDir: string
+): { disp: string; fullPath: string; isLocal: boolean }[] {
+  const linked: { disp: string; fullPath: string; isLocal: boolean }[] = [];
+  const seen = new Set<string>();
+
+  const scanIdeProj = (dir: string, depth = 0) => {
+    if (depth > 3) return;
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          scanIdeProj(full, depth + 1);
+        } else if (/\.(uvprojx|uvproj|ewp)$/i.test(entry.name)) {
+          const xml = fs.readFileSync(full, "utf-8");
+          const fpRegex = /<FilePath>([^<]+\.(?:c|h|s|S))<\/FilePath>/g;
+          let m: RegExpExecArray | null;
+          while ((m = fpRegex.exec(xml)) !== null) {
+            const rawRel = m[1]
+              .trim()
+              .replace(/^\$PROJ_DIR\$[\\/]/, "");
+            const candidate = path.resolve(dir, rawRel);
+            if (fs.existsSync(candidate) && !seen.has(candidate)) {
+              seen.add(candidate);
+              const isInside = candidate
+                .toLowerCase()
+                .startsWith(rootDir.toLowerCase());
+              const disp = isInside
+                ? normalizeRelPath(rootDir, candidate)
+                : candidate
+                    .replace(/\\/g, "/")
+                    .split("/")
+                    .slice(-4)
+                    .join("/");
+              linked.push({
+                disp,
+                fullPath: candidate,
+                isLocal: !disp.startsWith("Drivers/"),
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+  scanIdeProj(rootDir);
+  return linked;
+}
+
+function extractProjectReadmeSummary(rootDir: string): string | undefined {
+  for (const name of ["readme.txt", "README.txt", "README.md", "readme.md"]) {
+    const p = path.join(rootDir, name);
+    if (fs.existsSync(p)) {
+      try {
+        const txt = fs.readFileSync(p, "utf-8");
+        const out: string[] = [];
+        let inDesc = false;
+        for (const l of txt.split(/\r?\n/)) {
+          const t = l.trim().replace(/^\*+\s*/, "").trim();
+          if (t.startsWith("@brief")) {
+            out.push(t.replace(/^@brief\s*/, "").trim());
+          } else if (t.startsWith("@par Example Description")) {
+            inDesc = true;
+          } else if (inDesc) {
+            if (t.startsWith("@") || out.length >= 5) break;
+            if (t) out.push(t);
+          }
+        }
+        if (out.length > 0) return out.join(" ");
+      } catch {
+        // ignore
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseGlobalVariables(
+  relFile: string,
+  content: string,
+  macros: Record<string, number>
+): GlobalVarInfo[] {
+  const globals: GlobalVarInfo[] = [];
+  const lines = content.split(/\r?\n/);
+  let braceDepth = 0;
+  let lastComment = "";
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const rawLine = lines[idx];
+    const trimmed = rawLine.trim();
+
+    if (trimmed.startsWith("/*") && trimmed.endsWith("*/")) {
+      const c = trimmed
+        .replace(/^\/\*+/, "")
+        .replace(/\*+\/$/, "")
+        .replace(/^\*+/, "")
+        .trim();
+      if (c && !c.includes("Private variables")) lastComment = c;
+    } else if (trimmed.startsWith("//")) {
+      lastComment = trimmed.replace(/^\/+/, "").trim();
+    }
+
+    if (
+      braceDepth === 0 &&
+      !trimmed.startsWith("#") &&
+      !trimmed.startsWith("typedef")
+    ) {
+      const arrM = trimmed.match(
+        /^(?:static\s+)?(?:const\s+)?(?:volatile\s+)?([a-zA-Z_]\w*)\s+([a-zA-Z_]\w*)\s*\[\s*([A-Za-z0-9_]+)?\s*\]/
+      );
+      if (arrM && !C_KEYWORDS.has(arrM[2])) {
+        const baseT = arrM[1];
+        const name = arrM[2];
+        const dimStr = arrM[3] || "4";
+        const elemSz = TYPE_SIZE_MAP[baseT] ?? 4;
+        const count =
+          parseInt(dimStr, 10) || macros[dimStr] || 4;
+        globals.push({
+          name,
+          typeStr: `${baseT}[${dimStr}]`,
+          bytes: Math.max(4, elemSz * count),
+          file: relFile,
+          line: idx + 1,
+          isStatic: trimmed.startsWith("static "),
+          section: trimmed.includes("=") ? ".data" : ".bss",
+          description:
+            lastComment || `全局数组缓冲区 (${relFile}:${idx + 1})`,
+        });
+        lastComment = "";
+      } else {
+        const stM = trimmed.match(
+          /^(?:static\s+)?(struct\s+[a-zA-Z_]\w*|[A-Z][A-Za-z0-9_]*_HandleTypeDef|[a-zA-Z_]\w*_t)\s+([a-zA-Z_]\w*)\s*(?:=|;)/
+        );
+        if (stM && !C_KEYWORDS.has(stM[2]) && !trimmed.includes("(")) {
+          const typeS = stM[1];
+          const name = stM[2];
+          globals.push({
+            name,
+            typeStr: typeS,
+            bytes: TYPE_SIZE_MAP[typeS] ?? 32,
+            file: relFile,
+            line: idx + 1,
+            isStatic: trimmed.startsWith("static "),
+            section: trimmed.includes("=") ? ".data" : ".bss",
+            description:
+              lastComment || `外设句柄/全局状态结构体 (${relFile}:${idx + 1})`,
+          });
+          lastComment = "";
+        }
+      }
+    }
+
+    if (
+      trimmed.startsWith("*") ||
+      trimmed.startsWith("/*") ||
+      trimmed.startsWith("//")
+    ) {
+      continue;
+    }
+    const codeOnly = trimmed
+      .replace(/\/\*.*?\*\//g, "")
+      .replace(/\/\/.*$/, "");
+    for (const ch of codeOnly) {
+      if (ch === "{") braceDepth++;
+      else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+    }
+  }
+  return globals;
+}
+
 export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
   const resolvedRoot = path.resolve(rootDir);
   if (!fs.existsSync(resolvedRoot)) {
@@ -488,7 +914,9 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
     fs.existsSync(path.join(resolvedRoot, "core", "usbd_core.c")) &&
     fs.existsSync(path.join(resolvedRoot, "core", "usbh_core.c"));
 
-  const targetRelFiles: string[] = [];
+  const targetFiles: { disp: string; fullPath: string; isLocal: boolean }[] = [];
+  const seenDisp = new Set<string>();
+
   if (isCherryUsb) {
     const cherryFiles = [
       "cherryusb_config_template.h",
@@ -527,21 +955,25 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
       "osal/usb_osal_freertos.c",
     ];
     for (const f of cherryFiles) {
-      if (fs.existsSync(path.join(resolvedRoot, f))) {
-        targetRelFiles.push(f);
+      const full = path.join(resolvedRoot, f);
+      if (fs.existsSync(full)) {
+        seenDisp.add(f);
+        targetFiles.push({ disp: f, fullPath: full, isLocal: true });
       }
     }
   } else {
     const walk = (dir: string) => {
-      if (targetRelFiles.length >= 80) return;
+      if (targetFiles.length >= 70) return;
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (targetRelFiles.length >= 80) break;
+        if (targetFiles.length >= 70) break;
         if (
           entry.name.startsWith(".") ||
           entry.name === "node_modules" ||
           entry.name === "third_party" ||
           entry.name === "build" ||
-          entry.name === "target"
+          entry.name === "target" ||
+          entry.name === "Exe" ||
+          entry.name === "Obj"
         ) {
           continue;
         }
@@ -549,11 +981,27 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
         if (entry.isDirectory()) {
           walk(full);
         } else if (/\.(c|cpp|h|hpp)$/i.test(entry.name)) {
-          targetRelFiles.push(normalizeRelPath(resolvedRoot, full));
+          const disp = normalizeRelPath(resolvedRoot, full);
+          if (!isSyscallBoilerplate(disp) && !seenDisp.has(disp)) {
+            seenDisp.add(disp);
+            targetFiles.push({ disp, fullPath: full, isLocal: true });
+          }
         }
       }
     };
     walk(resolvedRoot);
+
+    for (const item of discoverIdeProjectLinkedFiles(resolvedRoot)) {
+      if (targetFiles.length >= 110) break;
+      if (
+        /\.(c|h)$/i.test(item.disp) &&
+        !isSyscallBoilerplate(item.disp) &&
+        !seenDisp.has(item.disp)
+      ) {
+        seenDisp.add(item.disp);
+        targetFiles.push(item);
+      }
+    }
   }
 
   const filesContent: Record<string, string> = {};
@@ -602,14 +1050,41 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
     checkStartupOrLinker(resolvedRoot);
   }
 
-  for (const rel of targetRelFiles) {
+  const configMacros: {
+    name: string;
+    defaultVal: string;
+    file: string;
+    purpose: string;
+  }[] = [];
+
+  for (const { disp, fullPath, isLocal } of targetFiles) {
     try {
-      const content = fs.readFileSync(path.join(resolvedRoot, rel), "utf-8");
-      filesContent[rel] = content;
-      const defRegex = /#define\s+([A-Z0-9_]+)\s+(\d+)\b/g;
+      const content = fs.readFileSync(fullPath, "utf-8");
+      filesContent[disp] = content;
+      const defRegex = /#define\s+([A-Z0-9_]+)\s+(0x[0-9a-fA-F]+|\d+)\b/g;
       let m: RegExpExecArray | null;
       while ((m = defRegex.exec(content)) !== null) {
-        macros[m[1]] = parseInt(m[2], 10);
+        const mName = m[1];
+        const mRaw = m[2];
+        const num = mRaw.toLowerCase().startsWith("0x")
+          ? parseInt(mRaw, 16)
+          : parseInt(mRaw, 10);
+        if (!Number.isNaN(num)) {
+          macros[mName] = num;
+        }
+        if (
+          isLocal &&
+          configMacros.length < 10 &&
+          !mName.endsWith("_H") &&
+          !mName.startsWith("USE_HAL_")
+        ) {
+          configMacros.push({
+            name: mName,
+            defaultVal: mRaw,
+            file: disp,
+            purpose: `定义于 ${disp} 的工程配置宏`,
+          });
+        }
       }
     } catch {
       // ignore
@@ -645,29 +1120,48 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
 
   const parsedFuncs = new Map<string, ParsedFileFunc>();
   const weakFuncNames = new Set<string>();
+  const genericGlobals: GlobalVarInfo[] = [];
 
-  for (const [rel, content] of Object.entries(filesContent)) {
-    if (!rel.endsWith(".c") && !rel.endsWith(".cpp")) continue;
-    const fns = parseCFileFunctions(rel, content, macros);
+  for (const { disp, isLocal } of targetFiles) {
+    if (!disp.endsWith(".c") && !disp.endsWith(".cpp")) continue;
+    const content = filesContent[disp];
+    if (!content) continue;
+
+    if (isLocal && !isCherryUsb) {
+      for (const g of parseGlobalVariables(disp, content, macros)) {
+        if (!genericGlobals.some((x) => x.name === g.name)) {
+          genericGlobals.push(g);
+        }
+      }
+    }
+
+    const fns = parseCFileFunctions(disp, content, macros, isLocal);
     for (const fn of fns) {
+      if (isSyscallBoilerplate(disp, fn.name)) continue;
       if (fn.isWeak) {
         weakFuncNames.add(fn.name);
       }
       const existing = parsedFuncs.get(fn.name);
-      if (!existing || (existing.isWeak && !fn.isWeak)) {
+      if (
+        !existing ||
+        (existing.isWeak && !fn.isWeak) ||
+        (!existing.isUserSrc && fn.isUserSrc)
+      ) {
         if (
           existing &&
           existing.file.startsWith("port/fsdev/") &&
-          rel.startsWith("port/dwc2/")
+          disp.startsWith("port/dwc2/")
         ) {
           continue;
         }
-        // Keep cdc_acm_template's usbd_event_handler as default primary
         if (
           existing &&
           existing.file === "demo/cdc_acm_template.c" &&
-          rel.startsWith("demo/")
+          disp.startsWith("demo/")
         ) {
+          continue;
+        }
+        if (existing && existing.isUserSrc && !fn.isUserSrc) {
           continue;
         }
         parsedFuncs.set(fn.name, fn);
@@ -690,7 +1184,9 @@ export function analyzeLocalCProject(rootDir: string): ProjectAnalysis {
     resolvedRoot,
     filesContent,
     parsedFuncs,
-    weakFuncNames
+    weakFuncNames,
+    genericGlobals,
+    configMacros
   );
   res.fileIncludes = fileIncludes;
   res.detectedMspStackBytes = detectedMspStackBytes;
@@ -1782,7 +2278,14 @@ function buildGenericCProjectAnalysis(
   rootDir: string,
   files: Record<string, string>,
   parsedFuncs: Map<string, ParsedFileFunc>,
-  weakFuncNames: Set<string>
+  weakFuncNames: Set<string>,
+  globals: GlobalVarInfo[] = [],
+  configMacros: {
+    name: string;
+    defaultVal: string;
+    file: string;
+    purpose: string;
+  }[] = []
 ): ProjectAnalysis {
   const nodes: Record<string, FunctionNodeData> = {};
   const edges: CallEdgeData[] = [];
@@ -1790,6 +2293,20 @@ function buildGenericCProjectAnalysis(
   for (const [name, pf] of parsedFuncs.entries()) {
     const isWeakSym = pf.isWeak || weakFuncNames.has(name);
     const layer = classifyLayerByFileAndName(pf.file, name, isWeakSym);
+    const readsGlobals: string[] = [];
+    const writesGlobals: string[] = [];
+    for (const g of globals) {
+      if (pf.body.includes(g.name)) {
+        readsGlobals.push(g.name);
+        if (
+          pf.body.includes(`&${g.name}`) ||
+          pf.body.includes(`${g.name}.`)
+        ) {
+          writesGlobals.push(g.name);
+        }
+      }
+    }
+
     nodes[name] = {
       id: name,
       name,
@@ -1799,21 +2316,63 @@ function buildGenericCProjectAnalysis(
       lineEnd: pf.lineEnd,
       layer,
       isCallback: layer === "CALLBACK",
-      isIsr: name.endsWith("_IRQHandler"),
+      isIsr: name.endsWith("_IRQHandler") || name === "SysTick_Handler",
       hasStateMachine: pf.hasSwitch,
       stackBytes: pf.stackBytes,
       localVars: pf.localVars,
       stackWarnings: pf.stackWarnings.length > 0 ? pf.stackWarnings : undefined,
-      readsGlobals: [],
-      writesGlobals: [],
+      readsGlobals,
+      writesGlobals,
       callsHeap: pf.callsHeap,
       heapApis: pf.heapApis,
       snippet: pf.snippet,
-      brief:
-        pf.switchCases.length > 0
-          ? `状态机 (${pf.switchCases.slice(0, 3).join(", ")}) — ${pf.file}:${pf.lineStart}`
-          : `${pf.file}:${pf.lineStart} (${pf.signature})`,
+      brief: synthesizeMeaningfulBrief(pf, layer),
     };
+  }
+
+  // Synthesize external HAL/BSP/CMSIS leaf nodes for user calls not defined in .c
+  for (const pf of parsedFuncs.values()) {
+    if (!pf.isUserSrc) continue;
+    for (const call of pf.directCalls) {
+      const callee = call.callee;
+      if (!nodes[callee] && !TRIVIAL_STD_CALLS.has(callee)) {
+        const low = callee.toLowerCase();
+        if (
+          low.startsWith("hal_") ||
+          low.startsWith("__hal_") ||
+          low.startsWith("bsp_") ||
+          low.startsWith("ll_") ||
+          low.startsWith("scb_") ||
+          low.startsWith("nvic_")
+        ) {
+          const extBrief = low.includes("_clk_enable")
+            ? `【RCC 硬件时钟宏】使能外设时钟 (${callee})`
+            : low.startsWith("scb_enable")
+            ? `【Cortex-M 内核 Cache 接口】开启 CPU L1 缓存 (${callee})`
+            : low.startsWith("bsp_led_")
+            ? `【板级 BSP 接口】控制开发板状态指示灯 (${callee})`
+            : low.startsWith("hal_mpu_")
+            ? `【Cortex-M MPU 硬件接口】配置内存保护单元 (${callee})`
+            : `【底层 HAL/BSP 驱动接口】外部硬件操作函数 ${callee}()`;
+          nodes[callee] = {
+            id: callee,
+            name: callee,
+            signature: `void ${callee}(...)`,
+            file: "Drivers/CMSIS_or_HAL_Macro",
+            lineStart: 1,
+            lineEnd: 1,
+            layer: "HAL",
+            isExternal: true,
+            stackBytes: 16,
+            localVars: [],
+            readsGlobals: [],
+            writesGlobals: [],
+            snippet: `/* Hardware Macro / External Driver Interface */\n${callee}(...);`,
+            brief: extBrief,
+          };
+        }
+      }
+    }
   }
 
   let edgeSeq = 1;
@@ -1860,13 +2419,16 @@ function buildGenericCProjectAnalysis(
       if (nodes[call.callee]) {
         const isWeakTarget =
           weakFuncNames.has(call.callee) ||
+          call.callee.endsWith("MspInit") ||
+          call.callee.endsWith("MspDeInit") ||
+          call.callee.endsWith("Callback") ||
           parsedFuncs.get(call.callee)?.isWeak;
         pushEdge({
           id: `e_gen_${edgeSeq++}`,
           source: name,
           target: call.callee,
           kind: isWeakTarget ? "WEAK_OVERRIDE" : "DIRECT",
-          label: isWeakTarget ? "__WEAK" : undefined,
+          label: isWeakTarget ? "__weak 硬件/事件回调" : undefined,
           callSiteLine: call.line,
         });
       }
@@ -1904,9 +2466,15 @@ function buildGenericCProjectAnalysis(
     }
 
     // Indirect struct field calls: e.g. dev->ops->read() paired with .read = bsp_read
+    // Scope to same file or matching module prefix first to avoid cross-peripheral false positives
     for (const fc of pf.fieldCalls) {
-      const boundHandlers = fieldToHandlers.get(fc.field) ?? [];
-      for (const h of boundHandlers.slice(0, 4)) {
+      const allBound = fieldToHandlers.get(fc.field) ?? [];
+      const fnPrefix = name.split("_").slice(0, 2).join("_");
+      const sameModule = allBound.filter(
+        (h) => h.loc.startsWith(pf.file) || h.fn.startsWith(fnPrefix)
+      );
+      const chosen = sameModule.length > 0 ? sameModule : allBound;
+      for (const h of chosen.slice(0, 3)) {
         pushEdge({
           id: `e_gen_${edgeSeq++}`,
           source: name,
@@ -1924,13 +2492,13 @@ function buildGenericCProjectAnalysis(
   for (const name of Object.keys(nodes)) adj.set(name, []);
   for (const e of edges) adj.get(e.source)?.push(e.target);
 
-  const collectReachable = (rootId: string) => {
+  const collectReachable = (rootId: string, maxNodes = 26) => {
     const visited = new Set<string>([rootId]);
     const queue = [rootId];
-    while (queue.length > 0 && visited.size < 28) {
+    while (queue.length > 0 && visited.size < maxNodes) {
       const curr = queue.shift()!;
       for (const nxt of adj.get(curr) ?? []) {
-        if (!visited.has(nxt)) {
+        if (!visited.has(nxt) && visited.size < maxNodes) {
           visited.add(nxt);
           queue.push(nxt);
         }
@@ -1939,52 +2507,212 @@ function buildGenericCProjectAnalysis(
     return Array.from(visited);
   };
 
-  const candidates = Object.values(nodes)
-    .map((n) => ({ node: n, reach: collectReachable(n.id) }))
-    .filter((c) => c.reach.length >= 2)
-    .sort((a, b) => b.reach.length - a.reach.length)
-    .slice(0, 10);
-
-  const entries: FeatureEntry[] = candidates.map((c, idx) => {
-    const reachSet = new Set(c.reach);
-    const subEdgeIds = edges
-      .filter((e) => reachSet.has(e.source) && reachSet.has(e.target))
+  const edgesForNodes = (nids: string[]) => {
+    const s = new Set(nids);
+    return edges
+      .filter((e) => s.has(e.source) && s.has(e.target))
       .map((e) => e.id);
-    const category: EntryCategory = c.node.isIsr
-      ? "ISR"
-      : c.node.name.includes("thread") || c.node.name.includes("task")
-      ? "RTOS_TASK"
-      : c.node.name === "main" || c.node.name.includes("init")
-      ? "MAIN_LOOP"
-      : "PUBLIC_API";
+  };
 
-    const outline: FlowStep[] = c.reach.slice(0, 5).map((nid, sIdx) => ({
-      id: `step_${idx}_${sIdx}`,
-      stage: `步骤 ${sIdx + 1}`,
-      title: `${nid}()`,
-      nodeId: nid,
-      detail: nodes[nid]?.brief || "",
-      tag:
-        nodes[nid]?.layer === "HAL"
-          ? "HAL"
-          : nodes[nid]?.isCallback
-          ? "CALLBACK"
-          : "FSM",
-    }));
+  const readmeSummary = extractProjectReadmeSummary(rootDir);
+  const entries: FeatureEntry[] = [];
 
-    return {
-      id: `gen_entry_${idx}`,
-      name: c.node.name,
-      displayName: `${c.node.name}() 调用链`,
-      category,
-      entryNodeId: c.node.id,
-      summary: `自动从 ${c.node.file} 提取的调用子图（共关联 ${c.reach.length} 个函数节点）`,
-      nodeIds: c.reach,
-      edgeIds: subEdgeIds,
-      configMacros: [],
-      staticFlowOutline: outline,
-    };
-  });
+  // 1. Always place `main` first if present, prioritizing business peripheral subtrees!
+  const mainPf = parsedFuncs.get("main");
+  if (mainPf) {
+    const nids: string[] = ["main"];
+    const seenM = new Set<string>(["main"]);
+    for (const ch of adj.get("main") ?? []) {
+      if (!seenM.has(ch)) {
+        seenM.add(ch);
+        nids.push(ch);
+      }
+    }
+    const priorityQ: string[] = [];
+    const secondaryQ: string[] = [];
+    for (const ch of nids.slice(1)) {
+      if (
+        [
+          "HAL_Init",
+          "SystemClock_Config",
+          "MPU_Config",
+          "CPU_CACHE_Enable",
+          "Error_Handler",
+        ].includes(ch)
+      ) {
+        secondaryQ.push(ch);
+      } else {
+        priorityQ.push(ch);
+      }
+    }
+    const queue = [...priorityQ, ...secondaryQ];
+    while (queue.length > 0 && nids.length < 30) {
+      const curr = queue.shift()!;
+      for (const nxt of adj.get(curr) ?? []) {
+        if (!seenM.has(nxt) && nids.length < 30) {
+          seenM.add(nxt);
+          nids.push(nxt);
+          queue.push(nxt);
+        }
+      }
+    }
+
+    const eids = edgesForNodes(nids);
+    const activePhases = mainPf.inlinePhases.filter(
+      (p) => p.calls.length > 0 || p.configs.length > 0
+    );
+
+    const outlineSteps: FlowStep[] =
+      activePhases.length > 0
+        ? activePhases.map((phase, pIdx) => {
+            const focusNode =
+              phase.calls.find((c) => Boolean(nodes[c])) || "main";
+            const callsStr =
+              phase.calls.length > 0
+                ? phase.calls.join(" ➔ ")
+                : "配置外设参数与状态";
+            const cfgStr =
+              phase.configs.length > 0
+                ? ` [参数: ${phase.configs.join(", ")}]`
+                : "";
+            return {
+              id: `main_phase_${pIdx}`,
+              stage: `阶段 ${pIdx + 1}: ${phase.title}`,
+              title: callsStr,
+              nodeId: focusNode,
+              detail: `执行 ${phase.calls.join(" / ") || "初始化"}${cfgStr}`,
+              tag: pIdx === 0 ? "INIT" : "FSM",
+            };
+          })
+        : nids.slice(0, 6).map((nid, sIdx) => ({
+            id: `main_s_${sIdx}`,
+            stage: `步骤 ${sIdx + 1}`,
+            title: `${nid}()`,
+            nodeId: nid,
+            detail: nodes[nid]?.brief || "",
+            tag: "FSM",
+          }));
+
+    entries.push({
+      id: "entry_main_full",
+      name: "main",
+      displayName: "main() — 工程主业务流程与硬件驱动全链路",
+      category: "MAIN_LOOP",
+      entryNodeId: "main",
+      summary:
+        readmeSummary ||
+        nodes["main"]?.brief ||
+        "主程序完整初始化与业务执行链路",
+      nodeIds: nids,
+      edgeIds: eids,
+      configMacros,
+      staticFlowOutline: outlineSteps,
+    });
+
+    // 2. Also create focused sub-entries for each major business API called inside main()
+    for (const call of mainPf.directCalls) {
+      const callee = call.callee;
+      if (
+        ["Error_Handler", "HAL_Init", "MPU_Config", "CPU_CACHE_Enable"].includes(
+          callee
+        ) ||
+        TRIVIAL_STD_CALLS.has(callee)
+      ) {
+        continue;
+      }
+      if (nodes[callee]) {
+        const subNids = collectReachable(callee, 18);
+        if (subNids.length >= 2) {
+          entries.push({
+            id: `entry_sub_${callee}`,
+            name: callee,
+            displayName: `${callee}() 子系统深层实现链路`,
+            category:
+              callee.includes("Clock") || callee.includes("Init")
+                ? "MAIN_LOOP"
+                : "PUBLIC_API",
+            entryNodeId: callee,
+            summary: nodes[callee]?.brief || "",
+            nodeIds: subNids,
+            edgeIds: edgesForNodes(subNids),
+            configMacros,
+            staticFlowOutline: subNids.slice(0, 5).map((nid, sIdx) => ({
+              id: `sub_${callee}_${sIdx}`,
+              stage: `调用层级 ${sIdx + 1}`,
+              title: `${nid}()`,
+              nodeId: nid,
+              detail: nodes[nid]?.brief || "",
+              tag: nodes[nid]?.layer === "HAL" ? "HAL" : "FSM",
+            })),
+          });
+        }
+      }
+    }
+  }
+
+  // 3. Add non-empty ISR / MSP Callback entries
+  for (const [name, pf] of parsedFuncs.entries()) {
+    if (!pf.isUserSrc || name === "main") continue;
+    if (
+      (name.endsWith("MspInit") ||
+        name.endsWith("_IRQHandler") ||
+        name === "SysTick_Handler") &&
+      pf.directCalls.length > 0
+    ) {
+      const nids = collectReachable(name, 14);
+      entries.push({
+        id: `entry_isr_${name}`,
+        name,
+        displayName: `${name}() 硬件回调/中断入口`,
+        category: "ISR",
+        entryNodeId: name,
+        summary: nodes[name]?.brief || "",
+        nodeIds: nids,
+        edgeIds: edgesForNodes(nids),
+        configMacros,
+        staticFlowOutline: [
+          {
+            id: `isr_step_${name}`,
+            stage: "中断/MSP 回调触发",
+            title: `${name}()`,
+            nodeId: name,
+            detail: nodes[name]?.brief || "",
+            tag: "CALLBACK",
+          },
+        ],
+      });
+    }
+  }
+
+  // 4. Fallback if no main()
+  if (entries.length === 0) {
+    const candidates = Object.values(nodes)
+      .map((n) => ({ node: n, reach: collectReachable(n.id, 24) }))
+      .filter((c) => c.reach.length >= 2)
+      .sort((a, b) => b.reach.length - a.reach.length)
+      .slice(0, 8);
+    candidates.forEach((c, idx) => {
+      entries.push({
+        id: `gen_entry_${idx}`,
+        name: c.node.name,
+        displayName: `${c.node.name}() 调用链`,
+        category: "PUBLIC_API",
+        entryNodeId: c.node.id,
+        summary: c.node.brief,
+        nodeIds: c.reach,
+        edgeIds: edgesForNodes(c.reach),
+        configMacros,
+        staticFlowOutline: c.reach.slice(0, 5).map((nid, sIdx) => ({
+          id: `step_${idx}_${sIdx}`,
+          stage: `步骤 ${sIdx + 1}`,
+          title: `${nid}()`,
+          nodeId: nid,
+          detail: nodes[nid]?.brief || "",
+          tag: "FSM",
+        })),
+      });
+    });
+  }
 
   const hasRtosCalls = Object.values(nodes).some((n) =>
     /^(xTask|vTask|osThread|rt_thread|usb_osal_thread)/i.test(n.name)
@@ -2001,7 +2729,7 @@ function buildGenericCProjectAnalysis(
     files,
     nodes,
     edges,
-    globals: [],
+    globals,
     entries,
   };
 }
