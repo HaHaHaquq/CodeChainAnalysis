@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <!-- Apple Space Black / Titanium Squircle Background -->
+    <linearGradient id="appleBg" x1="64" y1="4" x2="64" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#26282D" />
+      <stop offset="48%" stop-color="#141518" />
+      <stop offset="100%" stop-color="#090A0C" />
+    </linearGradient>
+    <linearGradient id="appleRim" x1="64" y1="4" x2="64" y2="124" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#8E8E93" stop-opacity="0.65" />
+      <stop offset="100%" stop-color="#3A3A3C" stop-opacity="0.2" />
+    </linearGradient>
+    <!-- Apple Iconic Liquid Silver / Anodized Platinum Gradient (Main Chain) -->
+    <linearGradient id="appleSilverMain" x1="26" y1="22" x2="96" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="42%" stop-color="#E5E5EA" />
+      <stop offset="58%" stop-color="#F5F5F7" />
+      <stop offset="100%" stop-color="#8E8E93" />
+    </linearGradient>
+    <!-- Secondary Callback Branch (Brushed Titanium Silver) -->
+    <linearGradient id="appleSilverBranch" x1="62" y1="62" x2="96" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#D1D1D6" />
+      <stop offset="100%" stop-color="#8E8E93" />
+    </linearGradient>
+  </defs>
+
+  <!-- macOS Superellipse Squircle -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#appleBg)" stroke="url(#appleRim)" stroke-width="2" />
+
+  <!-- Secondary Callback Branch: Center Node -> Bottom-Right Solid Node -->
+  <path
+    d="M70 67 Q 79 74 88 79"
+    stroke="url(#appleSilverBranch)"
+    stroke-width="6.5"
+    stroke-linecap="round"
+  />
+  <circle cx="90" cy="80" r="6.5" fill="url(#appleSilverBranch)" />
+
+  <!-- Main Call-Chain Connecting Curves (3 Nodes Diagonal) -->
+  <path
+    d="M46 77 Q 52 67 55 68"
+    stroke="url(#appleSilverMain)"
+    stroke-width="7.5"
+    stroke-linecap="round"
+  />
+  <path
+    d="M70 55 Q 76 45 81 47"
+    stroke="url(#appleSilverMain)"
+    stroke-width="7.5"
+    stroke-linecap="round"
+  />
+
+  <!-- 3 Main Hollow Ring Nodes (Bottom-Left -> Center -> Top-Right) -->
+  <circle cx="38" cy="83" r="10.5" stroke="url(#appleSilverMain)" stroke-width="7" />
+  <circle cx="63" cy="62" r="10.5" stroke="url(#appleSilverMain)" stroke-width="7" />
+  <circle cx="89" cy="41" r="10.5" stroke="url(#appleSilverMain)" stroke-width="7" />
+</svg>

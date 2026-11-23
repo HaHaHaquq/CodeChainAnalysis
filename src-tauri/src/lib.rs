@@ -1,0 +1,73 @@
+pub mod analyzer;
+
+use analyzer::{
+    analyze_local_c_project_with_progress, export_porting_bundle, ExportPortingPayload,
+};
+use serde_json::{json, Value};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+
+#[tauri::command]
+fn get_engine_status() -> Value {
+    json!({
+        "engine": "ChainAnalysis Rust Core",
+        "version": env!("CARGO_PKG_VERSION"),
+        "stage": "M4_FULL_DESKTOP_APP",
+        "native": true
+    })
+}
+
+#[tauri::command]
+async fn analyze_c_project(app: tauri::AppHandle, path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_local_c_project_with_progress(&path, |percent, stage, detail| {
+            let _ = app.emit(
+                "analysis-progress",
+                json!({
+                    "percent": percent,
+                    "stage": stage,
+                    "detail": detail,
+                }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn export_porting_package(payload: ExportPortingPayload) -> Result<Value, String> {
+    export_porting_bundle(payload)
+}
+
+#[tauri::command]
+fn open_standalone_drawer(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("drawer_popup") {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(
+        &app,
+        "drawer_popup",
+        WebviewUrl::App("index.html?standalone=drawer".into()),
+    )
+    .title("ChainAnalysis — 独立源码与移植分析副窗口")
+    .inner_size(780.0, 920.0)
+    .min_inner_size(420.0, 500.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            get_engine_status,
+            analyze_c_project,
+            export_porting_package,
+            open_standalone_drawer
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

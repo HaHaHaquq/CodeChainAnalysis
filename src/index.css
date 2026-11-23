@@ -1,0 +1,92 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body,
+  #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: #070b13;
+    color: #e2e8f0;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+}
+
+/* Subtle dark scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.4);
+}
+
+/* React Flow dark overrides */
+.react-flow__attribution {
+  display: none !important;
+}
+
+.react-flow__controls {
+  background: rgba(15, 23, 42, 0.82) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  backdrop-filter: blur(12px);
+  border-radius: 12px !important;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+
+.react-flow__controls-button {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+  fill: #cbd5e1 !important;
+}
+
+.react-flow__controls-button:hover {
+  background: rgba(56, 189, 248, 0.15) !important;
+  fill: #38bdf8 !important;
+}
+
+.react-flow__minimap {
+  background: rgba(10, 15, 28, 0.85) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 12px !important;
+  backdrop-filter: blur(12px);
+}
+
+@keyframes edgeDashFlow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+.edge-callback-animated path.react-flow__edge-path {
+  animation: edgeDashFlow 1.1s linear infinite;
+}
+
+.edge-heatmap-glow path.react-flow__edge-path {
+  filter: drop-shadow(0 0 6px rgba(239, 68, 68, 0.85));
+}
+
+.edge-recursion-glow path.react-flow__edge-path {
+  filter: drop-shadow(0 0 6px rgba(192, 132, 252, 0.9));
+}
+
+/* Monaco highlighted line */
+.chain-monaco-active-line {
+  background: rgba(34, 211, 238, 0.14) !important;
+  border-left: 3px solid #22d3ee !important;
+}
