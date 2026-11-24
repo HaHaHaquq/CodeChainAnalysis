@@ -156,8 +156,13 @@ export const SmartFunctionNode: React.FC<NodeProps> = memo(({ data }) => {
           {fn.file}:{fn.lineStart}
         </div>
 
-        {/* Brief */}
-        <p className="mt-1.5 line-clamp-2 text-[11px] leading-relaxed text-slate-300/85">
+        {/* Brief (expands to full text when card is selected or snippet is open; also shows full text on hover) */}
+        <p
+          title={fn.brief}
+          className={`mt-1.5 text-[11px] leading-relaxed text-slate-300/90 ${
+            isSelected || isExpandedSnippet ? "" : "line-clamp-2"
+          }`}
+        >
           {fn.brief}
         </p>
 

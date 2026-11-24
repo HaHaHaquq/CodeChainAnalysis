@@ -1,6 +1,6 @@
 [package]
 name = "chain-analysis"
-version = "0.1.0"
+version = "0.2.0"
 description = "Embedded C/C++ Call-Chain, Callback, Stack & Porting Boundary Desktop App"
 authors = ["ChainAnalysis"]
 edition = "2021"

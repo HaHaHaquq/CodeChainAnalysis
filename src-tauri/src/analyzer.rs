@@ -29,6 +29,24 @@ struct InlinePhase {
 }
 
 #[derive(Debug, Clone)]
+struct CallSiteDetail {
+    callee: String,
+    line: usize,
+    args_text: String,
+    expr: String,
+    conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FieldBindDetail {
+    field: String,
+    target_fn: String,
+    line: usize,
+    expr: String,
+    conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct ParsedFunc {
     name: String,
     signature: String,
@@ -49,8 +67,8 @@ struct ParsedFunc {
     stack_warnings: Vec<String>,
     calls_heap: bool,
     heap_apis: Vec<String>,
-    direct_calls: Vec<(String, usize, String)>,
-    field_assignments: Vec<(String, String, usize)>,
+    direct_calls: Vec<CallSiteDetail>,
+    field_assignments: Vec<FieldBindDetail>,
     field_calls: Vec<(String, usize)>,
 }
 
@@ -364,13 +382,7 @@ fn synthesize_meaningful_brief(pf: &ParsedFunc, layer: &str) -> String {
 
     if let Some(doc) = &pf.doc_brief {
         if !doc.eq_ignore_ascii_case("Main program") && !doc.eq_ignore_ascii_case("HAL MSP module.") {
-            let truncated = if doc.chars().count() > 86 {
-                let s: String = doc.chars().take(84).collect();
-                format!("{}…", s)
-            } else {
-                doc.clone()
-            };
-            parts.push(truncated);
+            parts.push(doc.clone());
         }
     }
 
@@ -380,21 +392,21 @@ fn synthesize_meaningful_brief(pf: &ParsedFunc, layer: &str) -> String {
             .inline_phases
             .iter()
             .map(|p| p.title.clone())
-            .take(4)
+            .take(6)
             .collect();
         parts.push(format!("流程阶段: {}", phase_titles.join(" ➔ ")));
     }
 
     // Add key hardware/struct parameter configs (e.g. "Algorithm=CRYP_AES_GCM, KeySize=CRYP_KEYSIZE_128B")
-    if !pf.config_assignments.is_empty() && parts.len() < 2 {
+    if !pf.config_assignments.is_empty() {
         let cfg_str = pf
             .config_assignments
             .iter()
-            .take(3)
+            .take(6)
             .cloned()
             .collect::<Vec<_>>()
             .join(", ");
-        parts.push(format!("配置: {}", cfg_str));
+        parts.push(format!("配置参数: {}", cfg_str));
     }
 
     // Add key calls summary if still short
@@ -402,7 +414,7 @@ fn synthesize_meaningful_brief(pf: &ParsedFunc, layer: &str) -> String {
         let key_calls: Vec<String> = pf
             .direct_calls
             .iter()
-            .map(|(c, _, _)| c.clone())
+            .map(|c| c.callee.clone())
             .filter(|c| !is_trivial_c_std_call(c) && c != "Error_Handler")
             .take(4)
             .collect();
@@ -691,8 +703,8 @@ fn parse_c_file_functions(
             let vars_total: u32 = local_vars.iter().map(|v| ((v.bytes + 3) / 4) * 4).sum();
             let stack_bytes = frame_overhead + vars_total;
 
-            let mut direct_calls = Vec::new();
-            let mut field_assignments = Vec::new();
+            let mut direct_calls: Vec<CallSiteDetail> = Vec::new();
+            let mut field_assignments: Vec<FieldBindDetail> = Vec::new();
             let mut field_calls = Vec::new();
             let mut config_assignments = Vec::new();
             let mut inline_phases: Vec<InlinePhase> = Vec::new();
@@ -701,8 +713,36 @@ fn parse_c_file_functions(
             let mut heap_apis = Vec::new();
             let mut in_multiline_comment = false;
 
+            // Track enclosing preprocessor (#if/#ifdef) and control-flow (if/else/switch/case) conditions
+            let mut pp_stack: Vec<String> = Vec::new();
+            let mut ctrl_stack: Vec<(i32, String)> = Vec::new(); // (brace_depth_at_entry, label)
+            let mut current_case: Option<(i32, String)> = None;
+            let mut brace_depth: i32 = 0;
+            let mut pending_ctrl: Option<String> = None;
+
             for (offset, b_line) in body_lines.iter().enumerate() {
                 let line_num = brace_idx + 2 + offset;
+                let trimmed_b = b_line.trim();
+
+                // Track preprocessor directives even before comment stripping
+                if trimmed_b.starts_with("#if") {
+                    pp_stack.push(trimmed_b.split("/*").next().unwrap_or(trimmed_b).trim().to_string());
+                    continue;
+                } else if trimmed_b.starts_with("#elif") {
+                    if !pp_stack.is_empty() {
+                        pp_stack.pop();
+                    }
+                    pp_stack.push(trimmed_b.split("/*").next().unwrap_or(trimmed_b).trim().to_string());
+                    continue;
+                } else if trimmed_b.starts_with("#else") {
+                    if let Some(last) = pp_stack.last_mut() {
+                        *last = format!("#else (反分支: {})", last);
+                    }
+                    continue;
+                } else if trimmed_b.starts_with("#endif") {
+                    pp_stack.pop();
+                    continue;
+                }
 
                 // Extract inline phase comments like /*##-1- Configure the CRYP peripheral ###*/ or /* Enable CRYP clock */
                 if is_user_src {
@@ -730,7 +770,6 @@ fn parse_c_file_functions(
                     }
                 }
 
-                let trimmed_b = b_line.trim();
                 if in_multiline_comment {
                     if trimmed_b.contains("*/") {
                         in_multiline_comment = false;
@@ -746,6 +785,67 @@ fn parse_c_file_functions(
 
                 let clean = b_line.split("//").next().unwrap_or("");
                 let clean = clean.split("/*").next().unwrap_or(clean);
+                let clean_trim = clean.trim();
+
+                // Track closing braces before checking new conditions on this line
+                let leading_closes = clean_trim.chars().take_while(|&c| c == '}').count() as i32;
+                if leading_closes > 0 {
+                    brace_depth = (brace_depth - leading_closes).max(0);
+                    ctrl_stack.retain(|(d, _)| *d <= brace_depth);
+                    if let Some((cd, _)) = &current_case {
+                        if *cd > brace_depth {
+                            current_case = None;
+                        }
+                    }
+                }
+
+                let after_close = clean_trim.trim_start_matches('}').trim();
+
+                // Detect control-flow headers (if / else if / else / switch / case)
+                if after_close.starts_with("if ") || after_close.starts_with("if(")
+                    || after_close.starts_with("else if")
+                    || after_close.starts_with("switch ") || after_close.starts_with("switch(")
+                {
+                    let cond_text = after_close
+                        .trim_end_matches('{')
+                        .trim()
+                        .to_string();
+                    pending_ctrl = Some(cond_text);
+                } else if after_close == "else" || after_close.starts_with("else {") || after_close == "else{" {
+                    pending_ctrl = Some("else 分支".to_string());
+                } else if let Some(cm) = case_re.captures(after_close) {
+                    current_case = Some((brace_depth, format!("case {}:", &cm[1])));
+                } else if after_close.starts_with("default:") {
+                    current_case = Some((brace_depth, "default:".to_string()));
+                }
+
+                // Helper closure to snapshot current condition stack
+                let snapshot_conditions = |pp: &[String], ctrl: &[(i32, String)], cur_case: &Option<(i32, String)>, pend: &Option<String>, is_on_cond_line: bool| -> Vec<String> {
+                    let mut conds: Vec<String> = Vec::new();
+                    for p in pp {
+                        conds.push(p.clone());
+                    }
+                    for (_, c) in ctrl {
+                        conds.push(c.clone());
+                    }
+                    if let Some((_, cs)) = cur_case {
+                        conds.push(cs.clone());
+                    }
+                    if !is_on_cond_line {
+                        if let Some(p) = pend {
+                            if !conds.contains(p) {
+                                conds.push(p.clone());
+                            }
+                        }
+                    }
+                    conds
+                };
+
+                let is_ctrl_header_line = after_close.starts_with("if ")
+                    || after_close.starts_with("if(")
+                    || after_close.starts_with("else if")
+                    || after_close.starts_with("while ")
+                    || after_close.starts_with("while(");
 
                 // Extract struct config assignments like CrypHandle.Init.Algorithm = CRYP_AES_GCM;
                 if is_user_src {
@@ -769,7 +869,14 @@ fn parse_c_file_functions(
                     let fld = am[1].to_string();
                     let tfn = am[2].to_string();
                     if !is_c_keyword(&tfn) {
-                        field_assignments.push((fld, tfn, line_num));
+                        let conds = snapshot_conditions(&pp_stack, &ctrl_stack, &current_case, &pending_ctrl, is_ctrl_header_line);
+                        field_assignments.push(FieldBindDetail {
+                            field: fld,
+                            target_fn: tfn,
+                            line: line_num,
+                            expr: clean_trim.to_string(),
+                            conditions: conds,
+                        });
                     }
                 }
 
@@ -796,7 +903,14 @@ fn parse_c_file_functions(
                         heap_apis.push(callee.clone());
                     }
                     if seen_callees.insert(callee.clone()) {
-                        direct_calls.push((callee.clone(), line_num, args_text));
+                        let conds = snapshot_conditions(&pp_stack, &ctrl_stack, &current_case, &pending_ctrl, is_ctrl_header_line);
+                        direct_calls.push(CallSiteDetail {
+                            callee: callee.clone(),
+                            line: line_num,
+                            args_text,
+                            expr: clean_trim.to_string(),
+                            conditions: conds,
+                        });
                     }
                     if let Some(last_phase) = inline_phases.last_mut() {
                         if !is_trivial_c_std_call(&callee)
@@ -806,6 +920,27 @@ fn parse_c_file_functions(
                             last_phase.calls.push(callee);
                         }
                     }
+                }
+
+                // Update brace depth for opening/closing braces on this line (excluding leading closes already handled)
+                for ch in after_close.chars() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                        if let Some(p) = pending_ctrl.take() {
+                            ctrl_stack.push((brace_depth, p));
+                        }
+                    } else if ch == '}' {
+                        brace_depth = (brace_depth - 1).max(0);
+                        ctrl_stack.retain(|(d, _)| *d <= brace_depth);
+                        if let Some((cd, _)) = &current_case {
+                            if *cd > brace_depth {
+                                current_case = None;
+                            }
+                        }
+                    }
+                }
+                if after_close.ends_with(';') && !is_ctrl_header_line {
+                    pending_ctrl = None;
                 }
             }
 
@@ -1383,7 +1518,8 @@ where
     // automatically synthesize external HAL boundary nodes so no hardware call is ever lost!
     if !is_cherry_usb {
         for pf in parsed_funcs.values().filter(|f| f.is_user_src) {
-            for (callee, _, _) in &pf.direct_calls {
+            for call in &pf.direct_calls {
+                let callee = &call.callee;
                 if !nodes_map.contains_key(callee) && !is_trivial_c_std_call(callee) {
                     let low = callee.to_lowercase();
                     if low.starts_with("hal_")
@@ -1482,12 +1618,19 @@ where
         }
     }
 
-    // Build edges
+    // Build edges with relationType, condition stack, and callSiteExpr
     let mut edges_vec: Vec<Value> = Vec::new();
     let mut edge_keys: HashSet<String> = HashSet::new();
     let mut edge_seq = 1;
 
-    let mut push_edge = |src: &str, tgt: &str, kind: &str, label: Option<String>, line: usize| {
+    let mut push_edge = |src: &str,
+                         tgt: &str,
+                         kind: &str,
+                         rel_type: &str,
+                         label: Option<String>,
+                         line: usize,
+                         expr: Option<String>,
+                         conditions: Vec<String>| {
         if src == tgt || !nodes_map.contains_key(src) || !nodes_map.contains_key(tgt) {
             return;
         }
@@ -1498,24 +1641,31 @@ where
                 "source": src,
                 "target": tgt,
                 "kind": kind,
+                "relationType": rel_type,
                 "label": label,
                 "callSiteLine": line,
+                "callSiteExpr": expr,
+                "conditions": if conditions.is_empty() { Value::Null } else { json!(conditions) },
             }));
             edge_seq += 1;
         }
     };
 
     for (name, pf) in &parsed_funcs {
-        for (fa_field, fa_target, line) in &pf.field_assignments {
+        for fa in &pf.field_assignments {
             push_edge(
                 name,
-                fa_target,
+                &fa.target_fn,
                 "OPS_TABLE",
-                Some(format!(".{} = {}", fa_field, fa_target)),
-                *line,
+                "BIND",
+                Some(format!(".{} = {}", fa.field, fa.target_fn)),
+                fa.line,
+                Some(fa.expr.clone()),
+                fa.conditions.clone(),
             );
         }
-        for (callee, line, args_text) in &pf.direct_calls {
+        for call in &pf.direct_calls {
+            let callee = &call.callee;
             let is_weak_t = weak_names.contains(callee)
                 || callee.ends_with("MspInit")
                 || callee.ends_with("MspDeInit")
@@ -1525,21 +1675,30 @@ where
                 name,
                 callee,
                 if is_weak_t { "WEAK_OVERRIDE" } else { "DIRECT" },
+                if is_weak_t { "WEAK_HOOK" } else { "CALL" },
                 if is_weak_t {
-                    Some("__weak 硬件/事件回调".into())
+                    Some("__weak 回调".into())
                 } else {
                     None
                 },
-                *line,
+                call.line,
+                Some(call.expr.clone()),
+                call.conditions.clone(),
             );
-            for tok in args_text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            for tok in call
+                .args_text
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            {
                 if !tok.is_empty() && tok != callee && nodes_map.contains_key(tok) {
                     push_edge(
                         name,
                         tok,
                         "ASYNC_CALLBACK",
+                        "BIND",
                         Some(format!("注册回调 ({})", callee)),
-                        *line,
+                        call.line,
+                        Some(call.expr.clone()),
+                        call.conditions.clone(),
                     );
                 }
             }
@@ -1548,20 +1707,20 @@ where
 
     if is_cherry_usb {
         let curated = [
-            ("usbd_desc_register", "device_descriptor_callback", "OPS_TABLE", "descriptors->device_descriptor_callback"),
-            ("usbd_add_endpoint", "usbd_cdc_acm_bulk_out", "ASYNC_CALLBACK", "rx_msg[ep].cb = ep->ep_cb"),
-            ("usbd_add_endpoint", "usbd_cdc_acm_bulk_in", "ASYNC_CALLBACK", "tx_msg[ep].cb = ep->ep_cb"),
-            ("usbd_initialize", "usbd_event_handler", "ASYNC_CALLBACK", "g_usbd_core.event_handler(INIT)"),
-            ("usbd_event_reset_handler", "device_descriptor_callback", "OPS_TABLE", "descriptors->device_descriptor_callback()"),
-            ("usbd_set_configuration", "usbd_event_handler", "ASYNC_CALLBACK", "event_handler(CONFIGURED)"),
-            ("usbd_class_request_handler", "cdc_acm_class_interface_request_handler", "OPS_TABLE", "intf->class_interface_handler()"),
-            ("usbd_event_ep_out_complete_handler", "usbd_cdc_acm_bulk_out", "ASYNC_CALLBACK", "rx_msg[ep].cb()"),
-            ("usbd_event_ep_in_complete_handler", "usbd_cdc_acm_bulk_in", "ASYNC_CALLBACK", "tx_msg[ep].cb()"),
-            ("usbh_enumerate", "usbh_hub_connect", "OPS_TABLE", "CLASS_CONNECT (hub->connect)"),
-            ("usbh_enumerate", "usbh_msc_connect", "OPS_TABLE", "CLASS_CONNECT (msc->connect)"),
+            ("usbd_desc_register", "device_descriptor_callback", "OPS_TABLE", "BIND", "descriptors->device_descriptor_callback"),
+            ("usbd_add_endpoint", "usbd_cdc_acm_bulk_out", "ASYNC_CALLBACK", "BIND", "rx_msg[ep].cb = ep->ep_cb"),
+            ("usbd_add_endpoint", "usbd_cdc_acm_bulk_in", "ASYNC_CALLBACK", "BIND", "tx_msg[ep].cb = ep->ep_cb"),
+            ("usbd_initialize", "usbd_event_handler", "ASYNC_CALLBACK", "INVOKE_CB", "g_usbd_core.event_handler(INIT)"),
+            ("usbd_event_reset_handler", "device_descriptor_callback", "OPS_TABLE", "INVOKE_CB", "descriptors->device_descriptor_callback()"),
+            ("usbd_set_configuration", "usbd_event_handler", "ASYNC_CALLBACK", "INVOKE_CB", "event_handler(CONFIGURED)"),
+            ("usbd_class_request_handler", "cdc_acm_class_interface_request_handler", "OPS_TABLE", "INVOKE_CB", "intf->class_interface_handler()"),
+            ("usbd_event_ep_out_complete_handler", "usbd_cdc_acm_bulk_out", "ASYNC_CALLBACK", "INVOKE_CB", "rx_msg[ep].cb()"),
+            ("usbd_event_ep_in_complete_handler", "usbd_cdc_acm_bulk_in", "ASYNC_CALLBACK", "INVOKE_CB", "tx_msg[ep].cb()"),
+            ("usbh_enumerate", "usbh_hub_connect", "OPS_TABLE", "INVOKE_CB", "CLASS_CONNECT (hub->connect)"),
+            ("usbh_enumerate", "usbh_msc_connect", "OPS_TABLE", "INVOKE_CB", "CLASS_CONNECT (msc->connect)"),
         ];
-        for (s, t, k, lbl) in curated {
-            push_edge(s, t, k, Some(lbl.to_string()), 1);
+        for (s, t, k, rt, lbl) in curated {
+            push_edge(s, t, k, rt, Some(lbl.to_string()), 1, Some(lbl.to_string()), Vec::new());
         }
     }
 
@@ -1907,8 +2066,8 @@ where
             }));
 
             // 2. Also create focused sub-entries for each major business API called inside main()
-            // (e.g. HAL_CRYP_Init, HAL_CRYP_Encrypt, HAL_CRYP_Decrypt, HAL_CRYPEx_AESGCM_GenerateAuthTAG, SystemClock_Config)
-            for (callee, _, _) in &main_pf.direct_calls {
+            for call in &main_pf.direct_calls {
+                let callee = &call.callee;
                 if matches!(
                     callee.as_str(),
                     "Error_Handler" | "HAL_Init" | "MPU_Config" | "CPU_CACHE_Enable"

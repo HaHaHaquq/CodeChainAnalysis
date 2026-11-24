@@ -13,6 +13,12 @@ export type EdgeKind =
   | "ASYNC_CALLBACK"
   | "WEAK_OVERRIDE";
 
+export type EdgeRelationType =
+  | "CALL"
+  | "BIND"
+  | "INVOKE_CB"
+  | "WEAK_HOOK";
+
 export type ViewMode = "CANVAS" | "SWIMLANE" | "SEQUENCE";
 
 /**
@@ -66,9 +72,12 @@ export interface CallEdgeData {
   source: string;
   target: string;
   kind: EdgeKind;
+  relationType?: EdgeRelationType;
   label?: string;
   registeredAt?: string;
   callSiteLine?: number;
+  callSiteExpr?: string;
+  conditions?: string[];
 }
 
 export interface GlobalVarInfo {

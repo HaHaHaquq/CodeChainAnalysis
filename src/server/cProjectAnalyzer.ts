@@ -132,9 +132,21 @@ interface ParsedFileFunc {
   stackWarnings: string[];
   callsHeap: boolean;
   heapApis: string[];
-  directCalls: { callee: string; line: number; argsText: string }[];
-  fieldAssignments: { field: string; targetFn: string; line: number }[];
-  fieldCalls: { field: string; line: number }[];
+  directCalls: {
+    callee: string;
+    line: number;
+    argsText: string;
+    expr: string;
+    conditions: string[];
+  }[];
+  fieldAssignments: {
+    field: string;
+    targetFn: string;
+    line: number;
+    expr: string;
+    conditions: string[];
+  }[];
+  fieldCalls: { field: string; line: number; expr: string; conditions: string[] }[];
 }
 
 const TRIVIAL_STD_CALLS = new Set([
@@ -260,20 +272,18 @@ function synthesizeMeaningfulBrief(
     pf.docBrief.toLowerCase() !== "main program" &&
     pf.docBrief.toLowerCase() !== "hal msp module."
   ) {
-    parts.push(
-      pf.docBrief.length > 88 ? pf.docBrief.slice(0, 86) + "…" : pf.docBrief
-    );
+    parts.push(pf.docBrief);
   }
   if (pf.inlinePhases.length > 0) {
     parts.push(
       `流程阶段: ${pf.inlinePhases
-        .slice(0, 4)
+        .slice(0, 6)
         .map((p) => p.title)
         .join(" ➔ ")}`
     );
   }
-  if (pf.configAssignments.length > 0 && parts.length < 2) {
-    parts.push(`配置: ${pf.configAssignments.slice(0, 3).join(", ")}`);
+  if (pf.configAssignments.length > 0) {
+    parts.push(`配置参数: ${pf.configAssignments.slice(0, 6).join(", ")}`);
   }
   if (parts.length === 0) {
     const keyCalls = pf.directCalls
@@ -570,13 +580,26 @@ function parseCFileFunctions(
         isIsr
       );
 
-      const directCalls: { callee: string; line: number; argsText: string }[] = [];
+      const directCalls: {
+        callee: string;
+        line: number;
+        argsText: string;
+        expr: string;
+        conditions: string[];
+      }[] = [];
       const fieldAssignments: {
         field: string;
         targetFn: string;
         line: number;
+        expr: string;
+        conditions: string[];
       }[] = [];
-      const fieldCalls: { field: string; line: number }[] = [];
+      const fieldCalls: {
+        field: string;
+        line: number;
+        expr: string;
+        conditions: string[];
+      }[] = [];
       const configAssignments: string[] = [];
       const inlinePhases: InlinePhase[] = [];
       const seenCallees = new Set<string>();
@@ -584,8 +607,32 @@ function parseCFileFunctions(
       const heapApis: string[] = [];
       let inMultilineComment = false;
 
+      const ppStack: string[] = [];
+      const ctrlStack: { depth: number; label: string }[] = [];
+      let currentCase: { depth: number; label: string } | null = null;
+      let braceDepth = 0;
+      let pendingCtrl: string | null = null;
+
       bodyLines.forEach((bLine, offset) => {
         const lineNum = braceLineIdx + 2 + offset;
+        const trimmedB = bLine.trim();
+
+        if (trimmedB.startsWith("#if")) {
+          ppStack.push(trimmedB.split("/*")[0].trim());
+          return;
+        } else if (trimmedB.startsWith("#elif")) {
+          ppStack.pop();
+          ppStack.push(trimmedB.split("/*")[0].trim());
+          return;
+        } else if (trimmedB.startsWith("#else")) {
+          if (ppStack.length > 0) {
+            ppStack[ppStack.length - 1] = `#else (反分支: ${ppStack[ppStack.length - 1]})`;
+          }
+          return;
+        } else if (trimmedB.startsWith("#endif")) {
+          ppStack.pop();
+          return;
+        }
 
         if (isUserSrc) {
           const cmtMatch = bLine.match(/\/\*+\s*(.*?)\s*\*+\//);
@@ -613,7 +660,6 @@ function parseCFileFunctions(
           }
         }
 
-        const trimmedB = bLine.trim();
         if (inMultilineComment) {
           if (trimmedB.includes("*/")) {
             inMultilineComment = false;
@@ -628,6 +674,44 @@ function parseCFileFunctions(
         }
 
         const clean = bLine.replace(/\/\/.*$/, "").replace(/\/\*.*$/, "");
+        const cleanTrim = clean.trim();
+
+        const leadingCloses = cleanTrim.match(/^}+/)?.[0].length ?? 0;
+        if (leadingCloses > 0) {
+          braceDepth = Math.max(0, braceDepth - leadingCloses);
+          while (ctrlStack.length > 0 && ctrlStack[ctrlStack.length - 1].depth > braceDepth) {
+            ctrlStack.pop();
+          }
+          if (currentCase && currentCase.depth > braceDepth) currentCase = null;
+        }
+
+        const afterClose = cleanTrim.replace(/^}+/, "").trim();
+        const isCtrlHeaderLine = /^(if\s*\(|else\s+if\s*\(|while\s*\(|switch\s*\()/.test(afterClose);
+
+        if (/^(if\s*\(|else\s+if\s*\(|switch\s*\()/.test(afterClose)) {
+          pendingCtrl = afterClose.replace(/\{$/, "").trim();
+        } else if (/^else(\s*\{)?$/.test(afterClose)) {
+          pendingCtrl = "else 分支";
+        } else {
+          const cm = afterClose.match(/^case\s+([A-Za-z0-9_]+)\s*:/);
+          if (cm) {
+            currentCase = { depth: braceDepth, label: `case ${cm[1]}:` };
+          } else if (afterClose.startsWith("default:")) {
+            currentCase = { depth: braceDepth, label: "default:" };
+          }
+        }
+
+        const snapshotConditions = () => {
+          const conds = [
+            ...ppStack,
+            ...ctrlStack.map((x) => x.label),
+          ];
+          if (currentCase) conds.push(currentCase.label);
+          if (!isCtrlHeaderLine && pendingCtrl && !conds.includes(pendingCtrl)) {
+            conds.push(pendingCtrl);
+          }
+          return conds;
+        };
 
         if (isUserSrc) {
           const cfgMatch = clean.match(
@@ -655,6 +739,8 @@ function parseCFileFunctions(
             field: assignMatch[1],
             targetFn: assignMatch[2],
             line: lineNum,
+            expr: cleanTrim,
+            conditions: snapshotConditions(),
           });
         }
 
@@ -665,7 +751,12 @@ function parseCFileFunctions(
           const fld = fm[1];
           if (!C_KEYWORDS.has(fld) && !seenFieldCalls.has(fld)) {
             seenFieldCalls.add(fld);
-            fieldCalls.push({ field: fld, line: lineNum });
+            fieldCalls.push({
+              field: fld,
+              line: lineNum,
+              expr: cleanTrim,
+              conditions: snapshotConditions(),
+            });
           }
         }
 
@@ -685,6 +776,8 @@ function parseCFileFunctions(
               callee,
               line: lineNum,
               argsText,
+              expr: cleanTrim,
+              conditions: snapshotConditions(),
             });
           }
           if (
@@ -695,6 +788,25 @@ function parseCFileFunctions(
             const lastP = inlinePhases[inlinePhases.length - 1];
             if (!lastP.calls.includes(callee)) lastP.calls.push(callee);
           }
+        }
+
+        for (const ch of afterClose) {
+          if (ch === "{") {
+            braceDepth++;
+            if (pendingCtrl) {
+              ctrlStack.push({ depth: braceDepth, label: pendingCtrl });
+              pendingCtrl = null;
+            }
+          } else if (ch === "}") {
+            braceDepth = Math.max(0, braceDepth - 1);
+            while (ctrlStack.length > 0 && ctrlStack[ctrlStack.length - 1].depth > braceDepth) {
+              ctrlStack.pop();
+            }
+            if (currentCase && currentCase.depth > braceDepth) currentCase = null;
+          }
+        }
+        if (afterClose.endsWith(";") && !isCtrlHeaderLine) {
+          pendingCtrl = null;
         }
       });
 
@@ -2428,8 +2540,11 @@ function buildGenericCProjectAnalysis(
           source: name,
           target: call.callee,
           kind: isWeakTarget ? "WEAK_OVERRIDE" : "DIRECT",
-          label: isWeakTarget ? "__weak 硬件/事件回调" : undefined,
+          relationType: isWeakTarget ? "WEAK_HOOK" : "CALL",
+          label: isWeakTarget ? "__weak 回调" : undefined,
           callSiteLine: call.line,
+          callSiteExpr: call.expr,
+          conditions: call.conditions.length > 0 ? call.conditions : undefined,
         });
       }
 
@@ -2442,15 +2557,18 @@ function buildGenericCProjectAnalysis(
             source: call.callee && nodes[call.callee] ? call.callee : name,
             target: tok,
             kind: "ASYNC_CALLBACK",
+            relationType: "BIND",
             label: `注册回调 (${call.callee})`,
             registeredAt: `${pf.file}:${call.line}`,
             callSiteLine: call.line,
+            callSiteExpr: call.expr,
+            conditions: call.conditions.length > 0 ? call.conditions : undefined,
           });
         }
       }
     }
 
-    // Direct field assignment inside function
+    // Direct field assignment inside function (pointer binding)
     for (const fa of pf.fieldAssignments) {
       if (nodes[fa.targetFn]) {
         pushEdge({
@@ -2458,9 +2576,12 @@ function buildGenericCProjectAnalysis(
           source: name,
           target: fa.targetFn,
           kind: "OPS_TABLE",
+          relationType: "BIND",
           label: `.${fa.field} = ${fa.targetFn}`,
           registeredAt: `${pf.file}:${fa.line}`,
           callSiteLine: fa.line,
+          callSiteExpr: fa.expr,
+          conditions: fa.conditions.length > 0 ? fa.conditions : undefined,
         });
       }
     }
@@ -2480,9 +2601,12 @@ function buildGenericCProjectAnalysis(
           source: name,
           target: h.fn,
           kind: "OPS_TABLE",
+          relationType: "INVOKE_CB",
           label: `->${fc.field}()`,
           registeredAt: h.loc,
           callSiteLine: fc.line,
+          callSiteExpr: fc.expr,
+          conditions: fc.conditions.length > 0 ? fc.conditions : undefined,
         });
       }
     }

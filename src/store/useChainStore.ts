@@ -47,7 +47,10 @@ interface ChainStore {
   activeEntryId: string;
   viewMode: ViewMode;
   heatmapEnabled: boolean;
+  showBindEdges: boolean;
   selectedNodeId: string | null;
+  selectedEdgeId: string | null;
+  edgeViewSide: "CALLER" | "TARGET";
   expandedSnippetIds: Record<string, boolean>;
   collapsedSubtreeIds: Record<string, boolean>;
   layerOverrides: Record<string, ArchLayer>;
@@ -73,7 +76,10 @@ interface ChainStore {
   setActiveEntry: (entryId: string) => void;
   setViewMode: (mode: ViewMode) => void;
   toggleHeatmap: () => void;
+  toggleShowBindEdges: () => void;
   selectNode: (nodeId: string | null, openDrawer?: boolean) => void;
+  selectEdge: (edgeId: string | null, openDrawer?: boolean) => void;
+  setEdgeViewSide: (side: "CALLER" | "TARGET") => void;
   openFileInEditor: (filePath: string, line?: number) => void;
   toggleSnippet: (nodeId: string) => void;
   toggleCollapseSubtree: (nodeId: string) => void;
@@ -99,7 +105,10 @@ export const useChainStore = create<ChainStore>((set) => ({
   activeEntryId: DEMO_PROJECT.entries[0].id,
   viewMode: "CANVAS",
   heatmapEnabled: false,
+  showBindEdges: true,
   selectedNodeId: DEMO_PROJECT.entries[0].entryNodeId,
+  selectedEdgeId: null,
+  edgeViewSide: "CALLER",
   expandedSnippetIds: {
     Ymodem_Parse_Packet: true,
     usbh_enumerate: true,
@@ -410,11 +419,13 @@ export const useChainStore = create<ChainStore>((set) => ({
         type: "SYNC_SELECTION",
         activeEntryId: entryId,
         selectedNodeId: nextNodeId,
+        selectedEdgeId: null,
         activeSourceFile: null,
       });
       return {
         activeEntryId: entryId,
         selectedNodeId: nextNodeId,
+        selectedEdgeId: null,
         activeSourceFile: null,
         collapsedSubtreeIds: {},
       };
@@ -422,6 +433,11 @@ export const useChainStore = create<ChainStore>((set) => ({
   setViewMode: (mode) => set({ viewMode: mode }),
   toggleHeatmap: () =>
     set((state) => ({ heatmapEnabled: !state.heatmapEnabled })),
+  toggleShowBindEdges: () =>
+    set((state) => ({
+      showBindEdges: !state.showBindEdges,
+      selectedEdgeId: null,
+    })),
   selectNode: (nodeId, openDrawer = false) =>
     set((state) => {
       const fn = nodeId ? state.project.nodes[nodeId] : undefined;
@@ -430,14 +446,56 @@ export const useChainStore = create<ChainStore>((set) => ({
         type: "SYNC_SELECTION",
         activeEntryId: state.activeEntryId,
         selectedNodeId: nodeId,
+        selectedEdgeId: null,
         activeSourceFile: fn?.file ?? null,
         rightTab: nextTab,
       });
       return {
         selectedNodeId: nodeId,
+        selectedEdgeId: null,
         activeSourceFile: fn?.file ?? state.activeSourceFile,
         rightDrawerOpen: openDrawer ? true : state.rightDrawerOpen,
         rightTab: nextTab,
+      };
+    }),
+  selectEdge: (edgeId, openDrawer = true) =>
+    set((state) => {
+      const edge = edgeId
+        ? state.project.edges.find((e) => e.id === edgeId)
+        : undefined;
+      const callerNode = edge ? state.project.nodes[edge.source] : undefined;
+      const nextTab = openDrawer && edge ? "SOURCE" : state.rightTab;
+      broadcastState({
+        type: "SYNC_SELECTION",
+        activeEntryId: state.activeEntryId,
+        selectedNodeId: edge ? edge.source : state.selectedNodeId,
+        selectedEdgeId: edgeId,
+        edgeViewSide: "CALLER",
+        activeSourceFile: callerNode?.file ?? state.activeSourceFile,
+        rightTab: nextTab,
+      });
+      return {
+        selectedEdgeId: edgeId,
+        selectedNodeId: edge ? edge.source : state.selectedNodeId,
+        edgeViewSide: "CALLER",
+        activeSourceFile: callerNode?.file ?? state.activeSourceFile,
+        rightDrawerOpen: openDrawer && edge ? true : state.rightDrawerOpen,
+        rightTab: nextTab,
+      };
+    }),
+  setEdgeViewSide: (side) =>
+    set((state) => {
+      const edge = state.selectedEdgeId
+        ? state.project.edges.find((e) => e.id === state.selectedEdgeId)
+        : undefined;
+      if (!edge) return { edgeViewSide: side };
+      const targetNode =
+        side === "CALLER"
+          ? state.project.nodes[edge.source]
+          : state.project.nodes[edge.target];
+      return {
+        edgeViewSide: side,
+        activeSourceFile: targetNode?.file ?? state.activeSourceFile,
       };
     }),
   openFileInEditor: (filePath) =>
@@ -497,6 +555,13 @@ export const useChainStore = create<ChainStore>((set) => ({
             (payload.activeEntryId as string) ?? state.activeEntryId,
           selectedNodeId:
             (payload.selectedNodeId as string | null) ?? state.selectedNodeId,
+          selectedEdgeId:
+            payload.selectedEdgeId !== undefined
+              ? (payload.selectedEdgeId as string | null)
+              : state.selectedEdgeId,
+          edgeViewSide:
+            (payload.edgeViewSide as "CALLER" | "TARGET" | undefined) ??
+            state.edgeViewSide,
           activeSourceFile:
             (payload.activeSourceFile as string | null) ??
             state.activeSourceFile,

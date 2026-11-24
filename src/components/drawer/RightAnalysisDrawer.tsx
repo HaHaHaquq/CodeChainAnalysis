@@ -26,7 +26,7 @@ import {
   PortingBoundaryResult,
   StackMetricsResult,
 } from "../../types/analysis";
-import { SWIMLANE_META } from "../../utils/layoutEngine";
+import { SWIMLANE_META, computeUpstreamPathToNode } from "../../utils/layoutEngine";
 
 interface RightAnalysisDrawerProps {
   activeEntry: FeatureEntry;
@@ -52,7 +52,11 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
   const rightTab = useChainStore((s) => s.rightTab);
   const setRightTab = useChainStore((s) => s.setRightTab);
   const selectedNodeId = useChainStore((s) => s.selectedNodeId);
+  const selectedEdgeId = useChainStore((s) => s.selectedEdgeId);
+  const edgeViewSide = useChainStore((s) => s.edgeViewSide);
+  const setEdgeViewSide = useChainStore((s) => s.setEdgeViewSide);
   const selectNode = useChainStore((s) => s.selectNode);
+  const selectEdge = useChainStore((s) => s.selectEdge);
   const layerOverrides = useChainStore((s) => s.layerOverrides);
   const setAiPromptModalOpen = useChainStore((s) => s.setAiPromptModalOpen);
   const setPortingCodeModalOpen = useChainStore(
@@ -63,9 +67,22 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const decorationsRef = useRef<string[]>([]);
 
+  const selectedEdge = selectedEdgeId
+    ? project.edges.find((e) => e.id === selectedEdgeId)
+    : undefined;
+  const edgeCallerNode = selectedEdge ? project.nodes[selectedEdge.source] : undefined;
+  const edgeTargetNode = selectedEdge ? project.nodes[selectedEdge.target] : undefined;
+
   const selectedNode = selectedNodeId ? project.nodes[selectedNodeId] : undefined;
   const currentFile =
-    activeSourceFile || (selectedNode ? selectedNode.file : Object.keys(project.files)[0] || "");
+    activeSourceFile ||
+    (selectedEdge
+      ? edgeViewSide === "CALLER"
+        ? edgeCallerNode?.file
+        : edgeTargetNode?.file
+      : selectedNode?.file) ||
+    Object.keys(project.files)[0] ||
+    "";
   const isViewingSelectedNodeFile =
     Boolean(selectedNode && currentFile === selectedNode.file);
 
@@ -73,11 +90,67 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
     (currentFile && project.files[currentFile]) ||
     (selectedNode
       ? `/* 外部库或头声明符号: ${selectedNode.file} */\n${selectedNode.signature}\n\n${selectedNode.snippet}`
-      : "// 点击画布上任意函数卡片或选择上方文件以查看完整 C/H 源码");
+      : "// 点击画布上任意函数卡片或连线以查看完整 C/H 源码");
 
   const highlightTargetLines = useCallback(() => {
     const editor = editorRef.current;
     if (!editor) return;
+
+    // Priority 1: If an edge is selected and we are viewing the caller's file at callSiteLine
+    if (
+      selectedEdge &&
+      edgeViewSide === "CALLER" &&
+      edgeCallerNode &&
+      currentFile === edgeCallerNode.file &&
+      selectedEdge.callSiteLine &&
+      selectedEdge.callSiteLine > 0
+    ) {
+      const targetLine = selectedEdge.callSiteLine;
+      editor.revealLineInCenter(targetLine);
+      decorationsRef.current = editor.deltaDecorations(decorationsRef.current, [
+        {
+          range: {
+            startLineNumber: targetLine,
+            startColumn: 1,
+            endLineNumber: targetLine,
+            endColumn: 1,
+          },
+          options: {
+            isWholeLine: true,
+            className: "chain-monaco-active-line",
+          },
+        },
+      ]);
+      return;
+    }
+
+    // Priority 2: If an edge is selected and we switched to viewing the target function definition
+    if (
+      selectedEdge &&
+      edgeViewSide === "TARGET" &&
+      edgeTargetNode &&
+      currentFile === edgeTargetNode.file
+    ) {
+      const start = Math.max(1, edgeTargetNode.lineStart);
+      const end = Math.max(start, edgeTargetNode.lineEnd);
+      editor.revealLineInCenter(start);
+      decorationsRef.current = editor.deltaDecorations(decorationsRef.current, [
+        {
+          range: {
+            startLineNumber: start,
+            startColumn: 1,
+            endLineNumber: end,
+            endColumn: 1,
+          },
+          options: {
+            isWholeLine: true,
+            className: "chain-monaco-active-line",
+          },
+        },
+      ]);
+      return;
+    }
+
     if (!selectedNode || !isViewingSelectedNodeFile) {
       decorationsRef.current = editor.deltaDecorations(
         decorationsRef.current,
@@ -103,14 +176,22 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
         },
       },
     ]);
-  }, [selectedNode, isViewingSelectedNodeFile]);
+  }, [
+    selectedEdge,
+    edgeViewSide,
+    edgeCallerNode,
+    edgeTargetNode,
+    selectedNode,
+    isViewingSelectedNodeFile,
+    currentFile,
+  ]);
 
   useEffect(() => {
     if (rightTab === "SOURCE") {
       const t = setTimeout(highlightTargetLines, 80);
       return () => clearTimeout(t);
     }
-  }, [selectedNodeId, currentFile, rightTab, highlightTargetLines]);
+  }, [selectedNodeId, selectedEdgeId, edgeViewSide, currentFile, rightTab, highlightTargetLines]);
 
   const handleStartResize = useCallback(
     (e: React.MouseEvent) => {
@@ -722,7 +803,170 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
               </select>
             </div>
 
-            {selectedNode && isViewingSelectedNodeFile && (
+            {/* ================= CALL-SITE EDGE INSPECTOR (when an edge is clicked) ================= */}
+            {selectedEdge && edgeCallerNode && edgeTargetNode && (() => {
+              const relType =
+                selectedEdge.relationType ??
+                (selectedEdge.kind === "WEAK_OVERRIDE"
+                  ? "WEAK_HOOK"
+                  : selectedEdge.kind === "ASYNC_CALLBACK"
+                  ? "INVOKE_CB"
+                  : selectedEdge.kind === "OPS_TABLE"
+                  ? "BIND"
+                  : "CALL");
+
+              const relMeta =
+                relType === "BIND"
+                  ? {
+                      badge: "📌 指针绑定 / 注册（此时不执行目标函数）",
+                      cls: "border-cyan-500/45 bg-cyan-500/15 text-cyan-200",
+                    }
+                  : relType === "INVOKE_CB"
+                  ? {
+                      badge: "⚡ 异步回调触发（经由函数指针执行）",
+                      cls: "border-orange-500/45 bg-orange-500/15 text-orange-200",
+                    }
+                  : relType === "WEAK_HOOK"
+                  ? {
+                      badge: "🟣 __weak 弱函数钩子（可被用户强重写）",
+                      cls: "border-purple-500/45 bg-purple-500/15 text-purple-200",
+                    }
+                  : {
+                      badge: "▶ 直接函数调用（同步顺序执行）",
+                      cls: "border-emerald-500/40 bg-emerald-500/15 text-emerald-200",
+                    };
+
+              const subEdges = project.edges.filter((e) =>
+                activeEntry.edgeIds.includes(e.id)
+              );
+              const upPath = computeUpstreamPathToNode(
+                activeEntry.entryNodeId,
+                selectedEdge.source,
+                subEdges
+              );
+              const fullChain = [...upPath.nodeIds, selectedEdge.target];
+
+              return (
+                <div className="border-b border-cyan-500/30 bg-slate-900/90 p-3 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className={`inline-flex items-center rounded-lg border px-2 py-0.5 text-[11px] font-bold ${relMeta.cls}`}
+                    >
+                      {relMeta.badge}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => selectEdge(null, false)}
+                      className="text-[10px] text-slate-400 hover:text-white"
+                    >
+                      ✕ 关闭关系透视
+                    </button>
+                  </div>
+
+                  {/* Upstream Full Call-Chain Breadcrumb */}
+                  <div className="rounded-lg bg-slate-950/90 px-2.5 py-1.5 border border-white/5">
+                    <div className="text-[10px] font-semibold text-slate-400 mb-1">
+                      完整到达链路（点击任意节点跳转）：
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
+                      {fullChain.map((nid, idx) => (
+                        <React.Fragment key={`${nid}_${idx}`}>
+                          {idx > 0 && (
+                            <span className="text-slate-500">➔</span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => selectNode(nid, true)}
+                            className={`rounded px-1.5 py-0.5 hover:underline ${
+                              nid === selectedEdge.target
+                                ? "bg-amber-500/20 text-amber-200 font-bold"
+                                : nid === selectedEdge.source
+                                ? "bg-cyan-500/20 text-cyan-200 font-bold"
+                                : "bg-slate-800 text-slate-300"
+                            }`}
+                          >
+                            {nid}()
+                          </button>
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Enclosing #if / if / switch-case Trigger Conditions Tree */}
+                  <div className="rounded-lg bg-slate-950/90 px-2.5 py-2 border border-white/5">
+                    <div className="text-[10px] font-semibold text-amber-300 mb-1">
+                      ⑂ 触发分支与宏条件栈：
+                    </div>
+                    {selectedEdge.conditions &&
+                    selectedEdge.conditions.length > 0 ? (
+                      <div className="space-y-1 font-mono text-[10px]">
+                        {selectedEdge.conditions.map((cond, idx) => (
+                          <div
+                            key={idx}
+                            style={{ paddingLeft: `${idx * 10}px` }}
+                            className={`break-all ${
+                              cond.startsWith("#")
+                                ? "text-purple-300"
+                                : cond.startsWith("case") ||
+                                  cond.startsWith("default")
+                                ? "text-amber-200"
+                                : "text-cyan-200"
+                            }`}
+                          >
+                            {idx > 0 ? "└─ " : ""}
+                            {cond}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-[10px] text-emerald-300/90">
+                        ✓ 无分支守卫（主干顺序必经路径）
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Full Untruncated Call/Bind Statement */}
+                  {selectedEdge.callSiteExpr && (
+                    <div className="rounded-lg bg-[#050810] px-2.5 py-1.5 border border-cyan-500/25 font-mono text-[11px] text-cyan-100 break-all">
+                      <span className="text-slate-500 mr-2">
+                        L{selectedEdge.callSiteLine || "?"}:
+                      </span>
+                      {selectedEdge.callSiteExpr}
+                    </div>
+                  )}
+
+                  {/* 2-Way Source Jump Toggle: Call Site in Caller vs Target Definition */}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setEdgeViewSide("CALLER")}
+                      className={`flex-1 rounded-lg border py-1.5 text-[11px] font-bold transition-colors ${
+                        edgeViewSide === "CALLER"
+                          ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100"
+                          : "border-white/10 bg-slate-800/80 text-slate-300 hover:text-white"
+                      }`}
+                    >
+                      📍 调用现场 ({edgeCallerNode.name}:L
+                      {selectedEdge.callSiteLine || edgeCallerNode.lineStart})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEdgeViewSide("TARGET")}
+                      className={`flex-1 rounded-lg border py-1.5 text-[11px] font-bold transition-colors ${
+                        edgeViewSide === "TARGET"
+                          ? "border-amber-400/60 bg-amber-500/20 text-amber-100"
+                          : "border-white/10 bg-slate-800/80 text-slate-300 hover:text-white"
+                      }`}
+                    >
+                      🎯 目标定义 ({edgeTargetNode.name}:L
+                      {edgeTargetNode.lineStart})
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {!selectedEdge && selectedNode && isViewingSelectedNodeFile && (
               <div className="border-b border-white/10 bg-slate-900/80 p-3 space-y-2">
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0">
@@ -751,6 +995,11 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
                     <Layers className="h-3 w-3" />
                     {layerOverrides[selectedNode.id] ?? selectedNode.layer}
                   </span>
+                </div>
+
+                {/* Full Function Description & Extracted Flow Summary */}
+                <div className="rounded-lg border border-cyan-500/25 bg-cyan-950/20 px-2.5 py-2 text-[11px] leading-relaxed text-slate-200">
+                  {selectedNode.brief}
                 </div>
 
                 {/* Local Stack Frame Breakdown */}

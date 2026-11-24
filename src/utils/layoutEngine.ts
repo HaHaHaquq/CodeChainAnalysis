@@ -110,11 +110,62 @@ interface BuildGraphParams {
   allEdges: CallEdgeData[];
   viewMode: ViewMode;
   heatmapEnabled: boolean;
+  showBindEdges: boolean;
   selectedNodeId: string | null;
+  selectedEdgeId: string | null;
   expandedSnippetIds: Record<string, boolean>;
   collapsedSubtreeIds: Record<string, boolean>;
   layerOverrides: Record<string, ArchLayer>;
   stackMetrics: StackMetricsResult;
+}
+
+export function computeUpstreamPathToNode(
+  rootId: string,
+  targetId: string,
+  edges: CallEdgeData[]
+): { nodeIds: string[]; edgeIds: string[] } {
+  if (rootId === targetId) return { nodeIds: [rootId], edgeIds: [] };
+  const adj = new Map<string, CallEdgeData[]>();
+  for (const e of edges) {
+    const arr = adj.get(e.source) ?? [];
+    arr.push(e);
+    adj.set(e.source, arr);
+  }
+  const visited = new Set<string>([rootId]);
+  const parentEdge = new Map<string, CallEdgeData>();
+  const queue = [rootId];
+  let found = false;
+
+  while (queue.length > 0) {
+    const curr = queue.shift()!;
+    for (const e of adj.get(curr) ?? []) {
+      if (!visited.has(e.target)) {
+        visited.add(e.target);
+        parentEdge.set(e.target, e);
+        if (e.target === targetId) {
+          found = true;
+          break;
+        }
+        queue.push(e.target);
+      }
+    }
+    if (found) break;
+  }
+
+  if (!found) return { nodeIds: [targetId], edgeIds: [] };
+  const nodeIds: string[] = [targetId];
+  const edgeIds: string[] = [];
+  let cur = targetId;
+  while (cur !== rootId) {
+    const pe = parentEdge.get(cur);
+    if (!pe) break;
+    edgeIds.push(pe.id);
+    nodeIds.push(pe.source);
+    cur = pe.source;
+  }
+  nodeIds.reverse();
+  edgeIds.reverse();
+  return { nodeIds, edgeIds };
 }
 
 export function buildReactFlowGraph(params: BuildGraphParams): {
@@ -127,7 +178,9 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
     allEdges,
     viewMode,
     heatmapEnabled,
+    showBindEdges,
     selectedNodeId,
+    selectedEdgeId,
     expandedSnippetIds,
     collapsedSubtreeIds,
     layerOverrides,
@@ -135,9 +188,12 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
   } = params;
 
   const entryNodeSet = new Set(entry.nodeIds);
-  const subEdges = allEdges.filter(
-    (e) => entry.edgeIds.includes(e.id) && entryNodeSet.has(e.source) && entryNodeSet.has(e.target)
-  );
+  const subEdges = allEdges.filter((e) => {
+    if (!entry.edgeIds.includes(e.id)) return false;
+    if (!entryNodeSet.has(e.source) || !entryNodeSet.has(e.target)) return false;
+    if (!showBindEdges && e.relationType === "BIND") return false;
+    return true;
+  });
 
   // Build adjacency & child count
   const childrenMap = new Map<string, string[]>();
@@ -185,6 +241,25 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
   const visibleEdges = subEdges.filter(
     (e) => visibleNodeSet.has(e.source) && visibleNodeSet.has(e.target)
   );
+
+  // If an edge is selected, highlight the full upstream path from entry -> edge.source -> edge.target
+  const selectedEdgeObj = selectedEdgeId
+    ? visibleEdges.find((e) => e.id === selectedEdgeId)
+    : undefined;
+  const highlightedEdgeSet = new Set<string>();
+  const highlightedNodeSet = new Set<string>();
+  if (selectedEdgeObj) {
+    highlightedEdgeSet.add(selectedEdgeObj.id);
+    highlightedNodeSet.add(selectedEdgeObj.source);
+    highlightedNodeSet.add(selectedEdgeObj.target);
+    const up = computeUpstreamPathToNode(
+      entry.entryNodeId,
+      selectedEdgeObj.source,
+      visibleEdges
+    );
+    up.edgeIds.forEach((eid) => highlightedEdgeSet.add(eid));
+    up.nodeIds.forEach((nid) => highlightedNodeSet.add(nid));
+  }
 
   const criticalNodes = new Set(stackMetrics.criticalPathNodeIds);
   const criticalEdges = new Set(stackMetrics.criticalPathEdgeIds);
@@ -320,18 +395,28 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
     });
   }
 
-  // Build semantic edges
+  // Build interactive semantic edges using custom InteractiveCallEdge
   const rfEdges: Edge[] = visibleEdges.map((e) => {
     const isCritical = heatmapEnabled && criticalEdges.has(e.id);
     const isRecursion = recursionEdges.has(e.id);
+    const isSelected = e.id === selectedEdgeId;
+    const isOnSelectedPath = highlightedEdgeSet.has(e.id);
 
     let stroke = "#64748b";
-    let strokeWidth = 1.8;
+    let strokeWidth = 1.9;
     let strokeDasharray: string | undefined = undefined;
     let animated = false;
     let className = "";
 
-    if (isRecursion) {
+    if (isSelected) {
+      stroke = "#38bdf8";
+      strokeWidth = 3.4;
+      animated = true;
+    } else if (isOnSelectedPath) {
+      stroke = "#22d3ee";
+      strokeWidth = 2.8;
+      animated = true;
+    } else if (isRecursion) {
       stroke = "#c084fc";
       strokeWidth = 2.8;
       strokeDasharray = "6 4";
@@ -342,14 +427,14 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
       strokeWidth = 3.2;
       animated = true;
       className = "edge-heatmap-glow";
-    } else if (e.kind === "ASYNC_CALLBACK") {
+    } else if (e.kind === "ASYNC_CALLBACK" || e.relationType === "INVOKE_CB") {
       stroke = "#fb923c";
-      strokeWidth = 2.4;
+      strokeWidth = 2.3;
       strokeDasharray = "6 4";
       className = "edge-callback-animated";
-    } else if (e.kind === "OPS_TABLE") {
+    } else if (e.kind === "OPS_TABLE" || e.relationType === "BIND") {
       stroke = "#22d3ee";
-      strokeWidth = 2.2;
+      strokeWidth = 2.0;
       strokeDasharray = "5 4";
       className = "edge-callback-animated";
     } else if (e.kind === "WEAK_OVERRIDE") {
@@ -358,68 +443,33 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
       strokeDasharray = "4 4";
     }
 
-    const dimmed = heatmapEnabled && !isCritical && !isRecursion;
-
-    const compactEdgeLabel = (raw?: string) => {
-      if (!raw) return undefined;
-      // Keep the most informative tail (e.g. "descriptors->device_descriptor_callback" -> "->device_descriptor_callback")
-      let s = raw.trim();
-      if (s.length > 28 && s.includes("->")) {
-        s = "->" + s.split("->").pop()!;
-      }
-      if (s.length > 28) {
-        s = s.slice(0, 26) + "…";
-      }
-      return s;
-    };
-
-    const shortLabel = compactEdgeLabel(e.label);
-
-    const labelText = isRecursion
-      ? `🔄 递归: ${shortLabel || "循环调用"}`
-      : shortLabel
-      ? e.kind === "ASYNC_CALLBACK"
-        ? `⚡ ${shortLabel}`
-        : e.kind === "OPS_TABLE"
-        ? `🔌 ${shortLabel}`
-        : shortLabel
-      : undefined;
+    const dimmed =
+      (heatmapEnabled && !isCritical && !isRecursion) ||
+      (Boolean(selectedEdgeObj) && !isOnSelectedPath);
 
     return {
       id: e.id,
       source: e.source,
       target: e.target,
-      type: viewMode === "SWIMLANE" ? "default" : "smoothstep",
+      type: "interactiveCall",
       animated,
       className,
-      label: labelText,
-      labelStyle: {
-        fill: isRecursion
-          ? "#e9d5ff"
-          : isCritical
-          ? "#fecaca"
-          : e.kind === "ASYNC_CALLBACK"
-          ? "#fed7aa"
-          : e.kind === "OPS_TABLE"
-          ? "#a5f3fc"
-          : "#cbd5e1",
-        fontSize: 10,
-        fontWeight: 600,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      zIndex: isSelected ? 30 : isOnSelectedPath ? 20 : 5,
+      data: {
+        edgeData: e,
+        isSelected,
+        isOnSelectedPath,
+        isCritical,
+        isRecursion,
+        dimmed,
+        strokeColor: stroke,
+        viewMode,
       },
-      labelBgStyle: {
-        fill: "#0f172a",
-        fillOpacity: 0.9,
-        stroke: stroke,
-        strokeWidth: 0.6,
-      },
-      labelBgPadding: [6, 3] as [number, number],
-      labelBgBorderRadius: 6,
       style: {
         stroke,
         strokeWidth,
         strokeDasharray,
-        opacity: dimmed ? 0.22 : 1,
+        opacity: dimmed ? 0.2 : 1,
       },
       markerEnd: {
         type: MarkerType.ArrowClosed,
