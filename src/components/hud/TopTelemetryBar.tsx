@@ -1,6 +1,8 @@
 import React from "react";
 import {
+  BookOpen,
   Cpu,
+  FileText,
   Flame,
   FolderOpen,
   GitCommitHorizontal,
@@ -10,9 +12,9 @@ import {
   PanelRightOpen,
   RefreshCw,
   RotateCcw,
-  Sparkles,
 } from "lucide-react";
-import { useChainStore } from "../../store/useChainStore";
+import { invoke } from "@tauri-apps/api/core";
+import { isTauriDesktop, useChainStore } from "../../store/useChainStore";
 import {
   PortingBoundaryResult,
   StackMetricsResult,
@@ -51,15 +53,15 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
   const hasOverrides = Object.keys(layerOverrides).length > 0;
   const riskColor =
     stackMetrics.rtosOverflowRisk === "CRITICAL"
-      ? "text-red-300 border-red-500/50 bg-red-500/15"
+      ? "text-[#e3a8af] border-[#c9858d]/40 bg-[#c9858d]/12"
       : stackMetrics.rtosOverflowRisk === "WARNING"
-      ? "text-amber-300 border-amber-500/50 bg-amber-500/15"
-      : "text-emerald-300 border-emerald-500/40 bg-emerald-500/15";
+      ? "text-[#e0be92] border-[#d2a266]/40 bg-[#d2a266]/12"
+      : "text-[#95c9b9] border-[#69ad99]/35 bg-[#69ad99]/10";
 
   return (
     <header className="pointer-events-none absolute top-3 left-3 right-3 z-30 flex items-center justify-between gap-3">
-      {/* Left: Brand + Project pill (Apple Space-Black & Metallic Silver Chain-Node Emblem) */}
-      <div className="pointer-events-auto flex items-center gap-2.5 rounded-2xl border border-white/15 bg-slate-950/85 px-3.5 py-2 backdrop-blur-xl shadow-2xl">
+      {/* Left: Brand + Project pill (Refined Editorial Slate) */}
+      <div className="pointer-events-auto flex items-center gap-2.5 rounded-2xl border border-slate-300/12 bg-[#141b26]/95 px-3.5 py-2 backdrop-blur-xl shadow-[0_8px_28px_rgba(0,0,0,0.32)]">
         <div className="flex h-8 w-8 items-center justify-center rounded-[9px] bg-gradient-to-b from-[#2c2c2e] via-[#1c1c1e] to-[#0a0a0c] border border-[#8e8e93]/40 shadow-[0_2px_10px_rgba(255,255,255,0.08)]">
           <svg
             viewBox="0 0 128 128"
@@ -155,38 +157,92 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
           type="button"
           title="切换或加载本地嵌入式 C/C++ 仓库目录"
           onClick={() => setOpenProjectModalOpen(true)}
-          className="ml-1 inline-flex items-center gap-1 rounded-lg border border-white/10 bg-slate-800/80 px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-cyan-400/50 hover:text-white transition-colors"
+          className="ml-1 inline-flex items-center gap-1 rounded-lg border border-slate-300/12 bg-[#1a2333] px-2.5 py-1 text-[11px] font-medium text-[#cbd5e1] hover:border-[#7b9acc]/45 hover:text-white transition-colors cursor-pointer"
         >
-          <FolderOpen className="h-3.5 w-3.5 text-cyan-400" />
+          <FolderOpen className="h-3.5 w-3.5 text-[#7b9acc]" />
           切换工程
         </button>
       </div>
 
-      {/* Center: Telemetry & View Switcher */}
-      <div className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-white/10 bg-slate-950/85 px-3 py-1.5 backdrop-blur-xl shadow-2xl">
-        {/* Runtime Requirement Pill: Bare-Metal vs RTOS */}
+      {/* Center: Calm View Switcher & Compact Telemetry */}
+      <div className="pointer-events-auto flex items-center gap-2 rounded-2xl border border-slate-300/10 bg-[#141b26]/95 px-3 py-1.5 backdrop-blur-xl shadow-[0_8px_28px_rgba(0,0,0,0.32)]">
+        {/* 4-Way Understanding View Switcher */}
+        <div className="flex items-center rounded-xl bg-[#0e131a] p-0.5 border border-slate-300/10">
+          <button
+            type="button"
+            onClick={() => setViewMode("STORY")}
+            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-all cursor-pointer ${
+              viewMode === "STORY"
+                ? "bg-[#7b9acc]/20 text-[#d0e0f7] border border-[#7b9acc]/45"
+                : "text-[#8b98a9] hover:text-[#dce4ee] border border-transparent"
+            }`}
+          >
+            <BookOpen className="h-3.5 w-3.5" />
+            功能导览
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("CANVAS")}
+            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-all cursor-pointer ${
+              viewMode === "CANVAS"
+                ? "bg-[#7b9acc]/20 text-[#d0e0f7] border border-[#7b9acc]/45"
+                : "text-[#8b98a9] hover:text-[#dce4ee] border border-transparent"
+            }`}
+          >
+            <Network className="h-3.5 w-3.5" />
+            调用图谱
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("SWIMLANE")}
+            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-all cursor-pointer ${
+              viewMode === "SWIMLANE"
+                ? "bg-[#69ad99]/20 text-[#bce3d6] border border-[#69ad99]/40"
+                : "text-[#8b98a9] hover:text-[#dce4ee] border border-transparent"
+            }`}
+          >
+            <Layers className="h-3.5 w-3.5" />
+            架构分层
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode("SEQUENCE")}
+            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition-all cursor-pointer ${
+              viewMode === "SEQUENCE"
+                ? "bg-[#d2a266]/20 text-[#edd0a8] border border-[#d2a266]/40"
+                : "text-[#8b98a9] hover:text-[#dce4ee] border border-transparent"
+            }`}
+          >
+            <GitCommitHorizontal className="h-3.5 w-3.5" />
+            时序链路
+          </button>
+        </div>
+
+        <div className="mx-0.5 h-5 w-px bg-slate-300/10" />
+
+        {/* Runtime Requirement Pill */}
         {stackMetrics.runtimeReq === "BARE_METAL_READY" ? (
           <div
-            title="该功能链路未调用任何 RTOS 线程/信号量/队列 API，可直接移植到纯裸机工程！"
-            className="flex items-center gap-1 rounded-lg border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-[11px] font-semibold text-emerald-300"
+            title="该功能链路未调用任何 RTOS 线程/信号量/队列 API"
+            className="hidden lg:flex items-center gap-1.5 rounded-lg border border-[#69ad99]/30 bg-[#69ad99]/10 px-2 py-1 text-[11px] font-medium text-[#95c9b9]"
           >
-            <span className="h-2 w-2 rounded-full bg-emerald-400" />
-            裸机可用 (0 OS)
+            <span className="h-1.5 w-1.5 rounded-full bg-[#69ad99]" />
+            裸机可用
           </div>
         ) : (
           <div
             title={`该功能调用了 OS 原语: ${stackMetrics.osApisUsed.join(", ")}`}
-            className="flex items-center gap-1 rounded-lg border border-sky-500/40 bg-sky-500/15 px-2.5 py-1 text-[11px] font-semibold text-sky-300"
+            className="hidden lg:flex items-center gap-1.5 rounded-lg border border-[#7b9acc]/30 bg-[#7b9acc]/10 px-2 py-1 text-[11px] font-medium text-[#a9c2eb]"
           >
-            <span className="h-2 w-2 rounded-full bg-sky-400" />
-            需 OSAL/RTOS
+            <span className="h-1.5 w-1.5 rounded-full bg-[#7b9acc]" />
+            需 RTOS
           </div>
         )}
 
         {/* Depth */}
-        <div className="flex items-center gap-1.5 rounded-lg bg-slate-900/90 px-2.5 py-1 text-[11px] text-slate-300 border border-white/5">
-          <span className="text-slate-500">深度</span>
-          <span className="font-mono font-bold text-slate-100">
+        <div className="hidden md:flex items-center gap-1.5 rounded-lg bg-[#101620] px-2 py-1 text-[11px] text-[#9aa7b8] border border-slate-300/[0.06]">
+          <span className="text-[#6f7e92]">深度</span>
+          <span className="font-mono font-semibold text-[#dce4ee]">
             {stackMetrics.maxDepth} 层
           </span>
         </div>
@@ -194,117 +250,70 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
         {/* WCS Stack */}
         <div
           title={`${stackMetrics.budgetSourceLabel} | 峰值栈深 ~${stackMetrics.maxStackBytes}B (${stackMetrics.budgetUsagePercent}%)`}
-          className={`flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-medium ${riskColor}`}
+          className={`hidden xl:flex items-center gap-1.5 rounded-lg border px-2 py-1 text-[11px] font-medium ${riskColor}`}
         >
-          <Flame className="h-3.5 w-3.5" />
-          <span>
-            {stackMetrics.stackKind === "MSP_BARE_METAL"
-              ? "裸机栈深(MSP)"
-              : "线程栈深(PSP)"}
-          </span>
-          <span className="font-mono font-bold">
+          <Flame className="h-3 w-3" />
+          <span className="font-mono font-semibold">
             ~{formatBytes(stackMetrics.maxStackBytes)}
           </span>
-          <span className="rounded bg-black/30 px-1 py-0.2 font-mono text-[10px]">
+          <span className="rounded bg-black/25 px-1 font-mono text-[10px]">
             {stackMetrics.budgetUsagePercent}%
           </span>
         </div>
 
         {/* Static RAM */}
-        <div className="hidden xl:flex items-center gap-1.5 rounded-lg bg-slate-900/90 px-2.5 py-1 text-[11px] text-slate-300 border border-white/5">
-          <Cpu className="h-3.5 w-3.5 text-indigo-400" />
-          <span className="text-slate-500">静态RAM</span>
-          <span className="font-mono font-bold text-indigo-200">
+        <div className="hidden 2xl:flex items-center gap-1.5 rounded-lg bg-[#101620] px-2 py-1 text-[11px] text-[#9aa7b8] border border-slate-300/[0.06]">
+          <Cpu className="h-3 w-3 text-[#859ce0]" />
+          <span className="font-mono font-semibold text-[#b8c6ef]">
             {formatBytes(porting.totalStaticRamBytes)}
           </span>
         </div>
 
-        {/* Recursion alert */}
         {stackMetrics.hasRecursion && (
-          <div className="flex items-center gap-1 rounded-lg border border-purple-400/60 bg-purple-500/20 px-2 py-1 text-[11px] font-semibold text-purple-200 animate-pulse">
-            <RefreshCw className="h-3.5 w-3.5" /> 递归风险
+          <div className="flex items-center gap-1 rounded-lg border border-[#9e8bc7]/40 bg-[#9e8bc7]/15 px-2 py-1 text-[11px] font-medium text-[#d2c6ed]">
+            <RefreshCw className="h-3 w-3" /> 递归
           </div>
         )}
 
-        <div className="mx-1 h-5 w-px bg-white/10" />
-
-        {/* Stack Heatmap Toggle */}
-        <button
-          type="button"
-          onClick={toggleHeatmap}
-          className={`inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold transition-all ${
-            heatmapEnabled
-              ? "bg-red-500/25 text-red-200 border border-red-500/60 shadow-[0_0_16px_rgba(239,68,68,0.35)]"
-              : "bg-slate-900/80 text-slate-300 border border-white/10 hover:border-red-400/40 hover:text-red-200"
-          }`}
-          title="高亮显示最坏情况最大栈深(WCS)调用路径"
-        >
-          <Flame className={`h-3.5 w-3.5 ${heatmapEnabled ? "text-red-400" : "text-slate-400"}`} />
-          栈深热力图
-        </button>
-
-        {/* Plan 2 <-> Plan 3 <-> Sequence Segmented View Switch */}
-        <div className="flex items-center rounded-xl bg-slate-900/90 p-0.5 border border-white/10">
+        {/* Stack Heatmap Toggle (only relevant in graph views) */}
+        {(viewMode === "CANVAS" || viewMode === "SWIMLANE") && (
           <button
             type="button"
-            onClick={() => setViewMode("CANVAS")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold transition-all ${
-              viewMode === "CANVAS"
-                ? "bg-cyan-500/25 text-cyan-200 border border-cyan-400/50 shadow-sm"
-                : "text-slate-400 hover:text-slate-200 border border-transparent"
+            onClick={toggleHeatmap}
+            className={`inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium transition-all cursor-pointer ${
+              heatmapEnabled
+                ? "bg-[#c9858d]/20 text-[#e8b4ba] border border-[#c9858d]/45"
+                : "bg-[#101620] text-[#8b98a9] border border-slate-300/10 hover:border-[#c9858d]/35 hover:text-[#dce4ee]"
             }`}
+            title="高亮显示最坏情况最大栈深(WCS)调用路径"
           >
-            <Network className="h-3.5 w-3.5" />
-            无界画布
+            <Flame className="h-3 w-3" />
+            栈热力
           </button>
-          <button
-            type="button"
-            onClick={() => setViewMode("SWIMLANE")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold transition-all ${
-              viewMode === "SWIMLANE"
-                ? "bg-emerald-500/25 text-emerald-200 border border-emerald-400/50 shadow-sm"
-                : "text-slate-400 hover:text-slate-200 border border-transparent"
-            }`}
-          >
-            <Layers className="h-3.5 w-3.5" />
-            四层泳道(移植)
-          </button>
-          <button
-            type="button"
-            onClick={() => setViewMode("SEQUENCE")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold transition-all ${
-              viewMode === "SEQUENCE"
-                ? "bg-amber-500/25 text-amber-200 border border-amber-400/50 shadow-sm"
-                : "text-slate-400 hover:text-slate-200 border border-transparent"
-            }`}
-          >
-            <GitCommitHorizontal className="h-3.5 w-3.5" />
-            时序生命线
-          </button>
-        </div>
+        )}
 
         {hasOverrides && (
           <button
             type="button"
             onClick={resetLayerOverrides}
             title="重置手动拖拽修改的架构泳道归属"
-            className="inline-flex items-center gap-1 rounded-lg border border-amber-500/40 bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-200 hover:bg-amber-500/25"
+            className="inline-flex items-center gap-1 rounded-lg border border-[#d2a266]/35 bg-[#d2a266]/12 px-2 py-1 text-[11px] font-medium text-[#e0be92] hover:bg-[#d2a266]/20 cursor-pointer"
           >
             <RotateCcw className="h-3 w-3" /> 重置分层
           </button>
         )}
       </div>
 
-      {/* Right: AI Prompt & Drawer Toggle */}
+      {/* Right: Offline Analysis Notes & Drawer Toggle */}
       <div className="pointer-events-auto flex items-center gap-2">
         <button
           type="button"
           onClick={() => setAiPromptModalOpen(true)}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-400/40 bg-indigo-600/25 px-3 py-2 text-xs font-semibold text-indigo-100 backdrop-blur-xl hover:bg-indigo-600/40 shadow-lg transition-colors"
-          title="免 API Key：一键导出当前功能精简调用链与移植上下文给免费网页 AI"
+          className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300/12 bg-[#141b26]/95 px-3 py-2 text-xs font-medium text-[#cbd5e1] backdrop-blur-xl hover:border-[#7b9acc]/45 hover:text-white shadow-md transition-colors cursor-pointer"
+          title="离线导出当前功能的 Markdown 调用链与框架摘要笔记"
         >
-          <Sparkles className="h-3.5 w-3.5 text-cyan-300" />
-          导出 AI Prompt
+          <FileText className="h-3.5 w-3.5 text-[#7b9acc]" />
+          导出分析笔记
         </button>
 
         {rightDrawerLayout === "DETACHED" ? (
@@ -313,8 +322,11 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
             onClick={() => {
               setRightDrawerLayout("SPLIT");
               setRightDrawerOpen(true);
+              if (isTauriDesktop()) {
+                invoke("close_standalone_drawer").catch(() => {});
+              }
             }}
-            className="inline-flex items-center gap-1 rounded-xl border border-cyan-400/50 bg-cyan-500/20 px-2.5 py-2 text-xs font-bold text-cyan-200 backdrop-blur-xl hover:bg-cyan-500/30 shadow-lg"
+            className="inline-flex items-center gap-1 rounded-xl border border-[#7b9acc]/45 bg-[#7b9acc]/18 px-2.5 py-2 text-xs font-medium text-[#d0e0f7] backdrop-blur-xl hover:bg-[#7b9acc]/28 shadow-md cursor-pointer"
             title="右侧面板已独立成窗，点击召回至主窗口分屏"
           >
             ↙ 召回右侧栏
@@ -323,8 +335,8 @@ export const TopTelemetryBar: React.FC<TopTelemetryBarProps> = ({
           <button
             type="button"
             onClick={() => setRightDrawerOpen(!rightDrawerOpen)}
-            className="inline-flex items-center justify-center rounded-xl border border-white/10 bg-slate-950/80 p-2 text-slate-300 backdrop-blur-xl hover:border-cyan-400/40 hover:text-white shadow-lg transition-colors"
-            title={rightDrawerOpen ? "收起右侧分析面板（全屏画布）" : "展开右侧分析面板"}
+            className="inline-flex items-center justify-center rounded-xl border border-slate-300/12 bg-[#141b26]/95 p-2 text-[#9aa7b8] backdrop-blur-xl hover:border-[#7b9acc]/45 hover:text-white shadow-md transition-colors cursor-pointer"
+            title={rightDrawerOpen ? "收起右侧分析面板" : "展开右侧分析面板"}
           >
             {rightDrawerOpen ? (
               <PanelRightClose className="h-4 w-4" />

@@ -103,7 +103,7 @@ export const useChainStore = create<ChainStore>((set) => ({
   analysisProgress: { percent: 0, stage: "", detail: "" },
   loadError: null,
   activeEntryId: DEMO_PROJECT.entries[0].id,
-  viewMode: "CANVAS",
+  viewMode: "STORY",
   heatmapEnabled: false,
   showBindEdges: true,
   selectedNodeId: DEMO_PROJECT.entries[0].entryNodeId,
@@ -182,12 +182,24 @@ export const useChainStore = create<ChainStore>((set) => ({
             path: target,
           });
         } catch (ipcErr) {
-          // Fallback to dev server if running inside tauri dev with vite
+          // Only fallback to Vite dev server when running under http://localhost (never in Tauri prod bundle)
+          const isViteDev =
+            typeof window !== "undefined" &&
+            window.location.protocol.startsWith("http") &&
+            (window.location.hostname === "localhost" ||
+              window.location.hostname === "127.0.0.1");
+          if (!isViteDev) {
+            throw ipcErr;
+          }
           const resp = await fetch(
             `/api/analyze?path=${encodeURIComponent(target)}`
           );
+          const ct = resp.headers.get("content-type") || "";
+          if (!resp.ok || !ct.includes("application/json")) {
+            throw ipcErr;
+          }
           const data = await resp.json();
-          if (!resp.ok || !data.ok) {
+          if (!data.ok) {
             throw ipcErr;
           }
           proj = data.project;
@@ -239,6 +251,10 @@ export const useChainStore = create<ChainStore>((set) => ({
         isLoadingProject: false,
         loadError: null,
         openProjectModalOpen: false,
+      });
+      broadcastState({
+        type: "SYNC_REPO_PATH",
+        repoPath: target,
       });
     } catch (err: unknown) {
       set({
@@ -589,6 +605,18 @@ export const useChainStore = create<ChainStore>((set) => ({
           rightDrawerOpen: true,
         };
       }
+      if (payload.type === "REQUEST_STATE") {
+        broadcastState({
+          type: "SYNC_SELECTION",
+          activeEntryId: state.activeEntryId,
+          selectedNodeId: state.selectedNodeId,
+          selectedEdgeId: state.selectedEdgeId,
+          edgeViewSide: state.edgeViewSide,
+          activeSourceFile: state.activeSourceFile,
+          rightTab: state.rightTab,
+        });
+        return state;
+      }
       return state;
     }),
 }));
@@ -596,6 +624,13 @@ export const useChainStore = create<ChainStore>((set) => ({
 if (syncChannel) {
   syncChannel.onmessage = (ev) => {
     if (ev.data && typeof ev.data === "object") {
+      if (ev.data.type === "SYNC_REPO_PATH" && typeof ev.data.repoPath === "string") {
+        const cur = useChainStore.getState().currentRepoPath;
+        if (ev.data.repoPath !== cur) {
+          useChainStore.getState().loadLocalProject(ev.data.repoPath);
+        }
+        return;
+      }
       useChainStore.getState().applyRemoteSync(ev.data);
     }
   };

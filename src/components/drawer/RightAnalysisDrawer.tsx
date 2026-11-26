@@ -42,6 +42,7 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
   isStandaloneWindow = false,
 }) => {
   const project = useChainStore((s) => s.project);
+  const currentRepoPath = useChainStore((s) => s.currentRepoPath);
   const rightDrawerOpen = useChainStore((s) => s.rightDrawerOpen);
   const rightDrawerLayout = useChainStore((s) => s.rightDrawerLayout);
   const setRightDrawerLayout = useChainStore((s) => s.setRightDrawerLayout);
@@ -216,7 +217,7 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
   const handlePopOutWindow = async () => {
     if (isTauriDesktop()) {
       try {
-        await invoke("open_standalone_drawer");
+        await invoke("open_standalone_drawer", { repoPath: currentRepoPath });
         setRightDrawerLayout("DETACHED");
         return;
       } catch {
@@ -224,7 +225,7 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
       }
     }
     const popup = window.open(
-      "/?standalone=drawer",
+      `/?standalone=drawer&repo=${encodeURIComponent(currentRepoPath)}`,
       "ChainAnalysisDrawerWindow",
       "width=780,height=920,menubar=no,toolbar=no,location=no,status=no"
     );
@@ -233,13 +234,21 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
     }
   };
 
-  const handleDockBackToMain = () => {
+  const handleDockBackToMain = async () => {
     try {
       const ch = new BroadcastChannel("chain_analysis_sync_v1");
       ch.postMessage({ type: "POPUP_CLOSED" });
       ch.close();
     } catch {
       // ignore
+    }
+    if (isTauriDesktop()) {
+      try {
+        await invoke("close_standalone_drawer");
+        return;
+      } catch {
+        // fallback below
+      }
     }
     window.close();
   };
@@ -251,10 +260,10 @@ export const RightAnalysisDrawer: React.FC<RightAnalysisDrawerProps> = ({
   const allFileList = Object.keys(project.files).sort();
 
   const containerClass = isStandaloneWindow
-    ? "h-screen w-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden"
+    ? "h-screen w-screen flex flex-col bg-[#121822] text-[#e6edf3] overflow-hidden"
     : rightDrawerLayout === "SPLIT"
-    ? "relative h-full shrink-0 flex flex-col border-l border-white/10 bg-slate-950/95 backdrop-blur-2xl shadow-2xl overflow-hidden z-20 pt-16"
-    : "absolute top-20 right-3 bottom-4 z-20 flex flex-col rounded-2xl border border-white/10 bg-slate-950/90 backdrop-blur-2xl shadow-2xl overflow-hidden";
+    ? "relative h-full shrink-0 flex flex-col border-l border-slate-300/10 bg-[#121822]/98 backdrop-blur-2xl shadow-xl overflow-hidden z-20 pt-16"
+    : "absolute top-20 right-3 bottom-4 z-20 flex flex-col rounded-2xl border border-slate-300/12 bg-[#121822]/96 backdrop-blur-2xl shadow-2xl overflow-hidden";
 
   return (
     <aside

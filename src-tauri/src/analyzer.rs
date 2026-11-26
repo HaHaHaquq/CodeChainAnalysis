@@ -47,6 +47,23 @@ struct FieldBindDetail {
 }
 
 #[derive(Debug, Clone)]
+struct FieldCallDetail {
+    receiver: String,
+    field: String,
+    line: usize,
+    expr: String,
+    conditions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OpsBinding {
+    var_name: String,
+    target_fn: String,
+    file: String,
+    line: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ParsedFunc {
     name: String,
     signature: String,
@@ -69,7 +86,21 @@ struct ParsedFunc {
     heap_apis: Vec<String>,
     direct_calls: Vec<CallSiteDetail>,
     field_assignments: Vec<FieldBindDetail>,
-    field_calls: Vec<(String, usize)>,
+    field_calls: Vec<FieldCallDetail>,
+}
+
+fn read_text_file_auto_encoding(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if let Ok(s) = std::str::from_utf8(&bytes[3..]) {
+            return Some(s.to_string());
+        }
+    }
+    if let Ok(s) = std::str::from_utf8(&bytes) {
+        return Some(s.to_string());
+    }
+    let (cow, _, _) = encoding_rs::GB18030.decode(&bytes);
+    Some(cow.into_owned())
 }
 
 fn is_c_keyword(w: &str) -> bool {
@@ -476,8 +507,8 @@ fn parse_c_file_functions(
     let assign_re = ASSIGN_RE.get_or_init(|| {
         Regex::new(r"(?:->|\.)([a-zA-Z_]\w*)\s*=\s*&?\s*([a-zA-Z_]\w*)\s*[,;]").unwrap()
     });
-    let field_call_re =
-        FIELD_CALL_RE.get_or_init(|| Regex::new(r"(?:->|\.)([a-zA-Z_]\w*)\s*\(").unwrap());
+    let field_call_re = FIELD_CALL_RE
+        .get_or_init(|| Regex::new(r"([a-zA-Z_]\w*)\s*(?:->|\.)\s*([a-zA-Z_]\w*)\s*\(").unwrap());
     let call_re =
         CALL_RE.get_or_init(|| Regex::new(r"\b([a-zA-Z_]\w*)\s*\(").unwrap());
     let cfg_assign_re = CFG_ASSIGN_RE.get_or_init(|| {
@@ -515,7 +546,7 @@ fn parse_c_file_functions(
         if starts_ident && line.contains('(') && !line.contains(';') {
             let mut header_text = line.to_string();
             let mut brace_idx = i;
-            while brace_idx < (i + 4).min(lines.len().saturating_sub(1))
+            while brace_idx < (i + 10).min(lines.len().saturating_sub(1))
                 && !header_text.contains('{')
                 && !header_text.contains(';')
             {
@@ -573,7 +604,11 @@ fn parse_c_file_functions(
             }
 
             let doc_brief = extract_preceding_doc_brief(&lines, i);
-            let body_lines = &lines[(brace_idx + 1)..end_idx];
+            let body_lines: &[&str] = if brace_idx + 1 < end_idx && end_idx < lines.len() {
+                &lines[(brace_idx + 1)..end_idx]
+            } else {
+                &[]
+            };
             let body = body_lines.join("\n");
 
             // Build meaningful snippet (prefer lines with calls, assignments, or phase comments)
@@ -815,7 +850,7 @@ fn parse_c_file_functions(
                     pending_ctrl = Some("else 分支".to_string());
                 } else if let Some(cm) = case_re.captures(after_close) {
                     current_case = Some((brace_depth, format!("case {}:", &cm[1])));
-                } else if after_close.starts_with("default:") {
+                } else if after_close.starts_with("default:") || after_close.starts_with("default :") {
                     current_case = Some((brace_depth, "default:".to_string()));
                 }
 
@@ -881,9 +916,24 @@ fn parse_c_file_functions(
                 }
 
                 for fm in field_call_re.captures_iter(clean) {
-                    let fld = fm[1].to_string();
-                    if !is_c_keyword(&fld) && seen_fcalls.insert(fld.clone()) {
-                        field_calls.push((fld, line_num));
+                    let recv = fm[1].to_string();
+                    let fld = fm[2].to_string();
+                    let key = format!("{}->{}", recv, fld);
+                    if !is_c_keyword(&fld) && !is_c_keyword(&recv) && seen_fcalls.insert(key) {
+                        let conds = snapshot_conditions(
+                            &pp_stack,
+                            &ctrl_stack,
+                            &current_case,
+                            &pending_ctrl,
+                            is_ctrl_header_line,
+                        );
+                        field_calls.push(FieldCallDetail {
+                            receiver: recv,
+                            field: fld,
+                            line: line_num,
+                            expr: clean_trim.to_string(),
+                            conditions: conds,
+                        });
                     }
                 }
 
@@ -1089,15 +1139,362 @@ fn parse_global_variables(
 /**
  * Discover external linked SDK files from Keil .uvprojx / IAR .ewp / Eclipse .project
  */
+fn is_ignored_scan_dir(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules"
+                | "third_party"
+                | "build"
+                | "target"
+                | "Exe"
+                | "Obj"
+                | "tests"
+                | "test"
+                | "doc"
+                | "docs"
+                | "dts"
+                | "scripts"
+                | "share"
+                | "snippets"
+                | "boards"
+                | "LICENSES"
+                | "submanifests"
+                | "cmake"
+        )
+}
+
+fn strip_c_comments_and_continuations(src: &str) -> String {
+    // 1. Join backslash-newline line continuations while preserving line count via spaces
+    let no_cont = src.replace("\\\r\n", " ").replace("\\\n", " ");
+    // 2. Strip /* ... */ and // ... comments while preserving '\n' so line numbers stay intact
+    let bytes = no_cont.as_bytes();
+    let mut out = String::with_capacity(no_cont.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            // Safe UTF-8 char step
+            if let Some(ch) = no_cont[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Extract generic C struct function-pointer tables (both typedef struct layouts,
+/// struct-pointer member types, and global positional/designated ops-table initializers).
+fn extract_struct_ops_tables(
+    files_content: &HashMap<String, String>,
+    parsed_funcs: &HashMap<String, ParsedFunc>,
+) -> (
+    HashMap<String, HashSet<String>>,
+    HashMap<(String, String), Vec<OpsBinding>>,
+    HashMap<String, HashSet<String>>,
+) {
+    static STRUCT_START_RE: OnceLock<Regex> = OnceLock::new();
+    static FN_PTR_FIELD_RE: OnceLock<Regex> = OnceLock::new();
+    static MEMBER_TYPE_RE: OnceLock<Regex> = OnceLock::new();
+    static GLOBAL_INIT_RE: OnceLock<Regex> = OnceLock::new();
+    static DESIG_ITEM_RE: OnceLock<Regex> = OnceLock::new();
+    static IDENT_END_RE: OnceLock<Regex> = OnceLock::new();
+
+    let struct_start_re = STRUCT_START_RE.get_or_init(|| {
+        Regex::new(r"\b(?:typedef\s+)?struct(?:\s+([A-Za-z_]\w*))?\s*\{").unwrap()
+    });
+    let fn_ptr_field_re =
+        FN_PTR_FIELD_RE.get_or_init(|| Regex::new(r"\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(").unwrap());
+    let member_type_re = MEMBER_TYPE_RE.get_or_init(|| {
+        Regex::new(r"(?:const\s+|volatile\s+|struct\s+)*([A-Za-z_]\w*)\s+\*?\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*;").unwrap()
+    });
+    let global_init_re = GLOBAL_INIT_RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]*(?:static\s+|const\s+|extern\s+|__ALIGN_BEGIN\s+)*(?:struct\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*=\s*\{").unwrap()
+    });
+    let desig_item_re = DESIG_ITEM_RE.get_or_init(|| {
+        Regex::new(r"\.([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?&?\s*([A-Za-z_]\w*)").unwrap()
+    });
+    let ident_end_re = IDENT_END_RE
+        .get_or_init(|| Regex::new(r"^(?:\([^)]*\)\s*)?&?\s*([A-Za-z_]\w*)$").unwrap());
+
+    let mut cleaned_files: Vec<(&String, String)> = Vec::with_capacity(files_content.len());
+    for (file, raw) in files_content {
+        cleaned_files.push((file, strip_c_comments_and_continuations(raw)));
+    }
+
+    // Pass 1: Discover all struct types that contain function-pointer fields (and their ordered field names)
+    let mut struct_fn_fields: HashMap<String, Vec<String>> = HashMap::new();
+    let mut raw_member_links: Vec<(String, String)> = Vec::new();
+
+    for (_, clean) in &cleaned_files {
+        for m in struct_start_re.captures_iter(clean) {
+            let full = m.get(0).unwrap();
+            let tag_name = m.get(1).map(|x| x.as_str().to_string());
+            let open_brace_idx = full.end() - 1;
+
+            // Brace match from open_brace_idx
+            let mut depth = 0i32;
+            let mut close_idx = None;
+            for (off, ch) in clean[open_brace_idx..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(open_brace_idx + off);
+                        break;
+                    }
+                }
+            }
+            let Some(end_brace) = close_idx else { continue };
+            let body = &clean[(open_brace_idx + 1)..end_brace];
+
+            // Capture typedef alias name after `}` up to `;`
+            let mut type_names: Vec<String> = Vec::new();
+            if let Some(tag) = tag_name {
+                type_names.push(tag);
+            }
+            if full.as_str().trim_start().starts_with("typedef") {
+                if let Some(semi_off) = clean[(end_brace + 1)..].find(';') {
+                    let tail = &clean[(end_brace + 1)..(end_brace + 1 + semi_off)];
+                    for part in tail.split(',') {
+                        let p = part.trim();
+                        if !p.is_empty() && !p.starts_with('*') {
+                            let clean_alias = p.trim_start_matches('*').trim();
+                            if clean_alias
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                && !clean_alias.is_empty()
+                            {
+                                type_names.push(clean_alias.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Extract function pointer fields in exact declaration order
+            let mut fn_fields: Vec<String> = Vec::new();
+            for fcap in fn_ptr_field_re.captures_iter(body) {
+                fn_fields.push(fcap[1].to_string());
+            }
+            if !fn_fields.is_empty() {
+                for tn in &type_names {
+                    struct_fn_fields
+                        .entry(tn.clone())
+                        .or_insert_with(|| fn_fields.clone());
+                }
+            }
+
+            // Record struct member name -> member type (to disambiguate receiver->field())
+            for mcap in member_type_re.captures_iter(body) {
+                let m_type = mcap[1].to_string();
+                let m_name = mcap[2].to_string();
+                if !is_c_keyword(&m_type) && !is_c_keyword(&m_name) {
+                    raw_member_links.push((m_name, m_type));
+                }
+            }
+        }
+    }
+
+    // Build receiver_name -> known ops-table StructType(s)
+    let mut receiver_to_types: HashMap<String, HashSet<String>> = HashMap::new();
+    for (m_name, m_type) in raw_member_links {
+        if struct_fn_fields.contains_key(&m_type) {
+            receiver_to_types.entry(m_name).or_default().insert(m_type);
+        }
+    }
+    // Also inspect function parameter signatures (e.g. `USBH_Class_cb_TypeDef *class_cb`)
+    let param_re = Regex::new(r"(?:struct\s+)?([A-Za-z_]\w*)\s+\*+\s*([A-Za-z_]\w*)").unwrap();
+    for pf in parsed_funcs.values() {
+        for pcap in param_re.captures_iter(&pf.signature) {
+            let p_type = &pcap[1];
+            let p_name = &pcap[2];
+            if struct_fn_fields.contains_key(p_type) {
+                receiver_to_types
+                    .entry(p_name.to_string())
+                    .or_default()
+                    .insert(p_type.to_string());
+            }
+        }
+    }
+
+    // Pass 2: Parse global struct ops-table initializers in .c files
+    let mut ops_bindings: HashMap<(String, String), Vec<OpsBinding>> = HashMap::new();
+    let mut field_only_types: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut seen_bindings: HashSet<(String, String, String)> = HashSet::new();
+
+    for (file, clean) in &cleaned_files {
+        if !file.ends_with(".c") && !file.ends_with(".cpp") {
+            continue;
+        }
+        for cap in global_init_re.captures_iter(clean) {
+            let full = cap.get(0).unwrap();
+            let type_name = cap[1].to_string();
+            let var_name = cap[2].to_string();
+            if is_c_keyword(&type_name) || is_c_keyword(&var_name) {
+                continue;
+            }
+            let open_brace_idx = full.end() - 1;
+            let mut depth = 0i32;
+            let mut close_idx = None;
+            for (off, ch) in clean[open_brace_idx..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(open_brace_idx + off);
+                        break;
+                    }
+                }
+            }
+            let Some(end_brace) = close_idx else { continue };
+            let init_body = &clean[(open_brace_idx + 1)..end_brace];
+            let start_line = clean[..full.start()].bytes().filter(|&b| b == b'\n').count() + 1;
+
+            let known_fields = struct_fn_fields.get(&type_name);
+            let has_desig = init_body.contains('.');
+            if known_fields.is_none() && !has_desig {
+                continue;
+            }
+
+            // Also map var_name itself to type_name for direct `HID_cb.Init()` calls
+            if known_fields.is_some() {
+                receiver_to_types
+                    .entry(var_name.clone())
+                    .or_default()
+                    .insert(type_name.clone());
+            }
+
+            // Split top-level comma items
+            let mut pos_idx = 0usize;
+            for raw_item in init_body.split(',') {
+                let item = raw_item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                if let Some(dc) = desig_item_re.captures(item) {
+                    let fld = dc[1].to_string();
+                    let tfn = dc[2].to_string();
+                    if parsed_funcs.contains_key(&tfn)
+                        && seen_bindings.insert((type_name.clone(), fld.clone(), tfn.clone()))
+                    {
+                        field_only_types
+                            .entry(fld.clone())
+                            .or_default()
+                            .insert(type_name.clone());
+                        ops_bindings
+                            .entry((type_name.clone(), fld))
+                            .or_default()
+                            .push(OpsBinding {
+                                var_name: var_name.clone(),
+                                target_fn: tfn,
+                                file: (*file).clone(),
+                                line: start_line,
+                            });
+                    }
+                } else if let Some(fields) = known_fields {
+                    if let Some(fld) = fields.get(pos_idx) {
+                        if let Some(ic) = ident_end_re.captures(item) {
+                            let tfn = ic[1].to_string();
+                            if parsed_funcs.contains_key(&tfn)
+                                && seen_bindings.insert((
+                                    type_name.clone(),
+                                    fld.clone(),
+                                    tfn.clone(),
+                                ))
+                            {
+                                field_only_types
+                                    .entry(fld.clone())
+                                    .or_default()
+                                    .insert(type_name.clone());
+                                ops_bindings
+                                    .entry((type_name.clone(), fld.clone()))
+                                    .or_default()
+                                    .push(OpsBinding {
+                                        var_name: var_name.clone(),
+                                        target_fn: tfn,
+                                        file: (*file).clone(),
+                                        line: start_line,
+                                    });
+                            }
+                        }
+                    }
+                }
+                pos_idx += 1;
+            }
+        }
+    }
+
+    (receiver_to_types, ops_bindings, field_only_types)
+}
+
 fn discover_ide_project_linked_files(root_path: &Path) -> Vec<(String, PathBuf)> {
     static UV_RE: OnceLock<Regex> = OnceLock::new();
     let uv_re =
         UV_RE.get_or_init(|| Regex::new(r"<FilePath>([^<]+\.(?:c|h|s|S))</FilePath>").unwrap());
 
+    let root_canon = fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
     let mut linked = Vec::new();
     let mut seen = HashSet::new();
 
-    for entry in WalkDir::new(root_path).max_depth(3).into_iter().flatten() {
+    let format_disp = |canon: &Path| -> String {
+        if let Ok(sub) = canon.strip_prefix(&root_canon) {
+            sub.to_string_lossy().replace('\\', "/")
+        } else if let Ok(sub) = canon.strip_prefix(root_path) {
+            sub.to_string_lossy().replace('\\', "/")
+        } else {
+            let comps: Vec<String> = canon
+                .components()
+                .rev()
+                .take(4)
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            comps.join("/")
+        }
+    };
+
+    let mut push_linked = |canon: PathBuf| {
+        if canon.exists() && seen.insert(canon.clone()) {
+            let disp = format_disp(&canon);
+            linked.push((disp, canon));
+        }
+    };
+
+    for (visited, entry) in WalkDir::new(root_path)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0 || !e.file_type().is_dir() || !is_ignored_scan_dir(&e.file_name().to_string_lossy())
+        })
+        .flatten()
+        .enumerate()
+    {
+        if visited > 1500 {
+            break;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1105,28 +1502,63 @@ fn discover_ide_project_linked_files(root_path: &Path) -> Vec<(String, PathBuf)>
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
         if matches!(ext, "uvprojx" | "uvproj" | "ewp") {
             let Some(proj_dir) = p.parent() else { continue };
-            if let Ok(xml) = fs::read_to_string(p) {
+            if let Some(xml) = read_text_file_auto_encoding(p) {
+                let mut linked_c_files: Vec<PathBuf> = Vec::new();
                 for caps in uv_re.captures_iter(&xml) {
                     let raw_rel = caps[1].trim().replace("$PROJ_DIR$\\", "").replace("$PROJ_DIR$/", "");
                     let candidate = proj_dir.join(&raw_rel);
                     if let Ok(canon) = fs::canonicalize(&candidate) {
-                        if canon.exists() && seen.insert(canon.clone()) {
-                            // Build a clean display path: if inside root_path, relative to root_path; otherwise keep last 3 segments (e.g. Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_cryp.c)
-                            let disp = if let Ok(sub) = canon.strip_prefix(root_path) {
-                                sub.to_string_lossy().replace('\\', "/")
-                            } else {
-                                let comps: Vec<String> = canon
-                                    .components()
-                                    .rev()
-                                    .take(4)
-                                    .map(|c| c.as_os_str().to_string_lossy().to_string())
-                                    .collect::<Vec<_>>()
-                                    .into_iter()
-                                    .rev()
-                                    .collect();
-                                comps.join("/")
-                            };
-                            linked.push((disp, canon));
+                        if canon.exists() {
+                            if canon.extension().and_then(|s| s.to_str()) == Some("c") {
+                                linked_c_files.push(canon.clone());
+                            }
+                            push_linked(canon);
+                        }
+                    }
+                }
+                // Auto-discover companion headers in same dir or sibling ../inc, ../Inc, ../include
+                // so struct ops-tables (e.g. usbh_core.h, usbh_hid_core.h) are always loaded!
+                let mut scanned_inc_dirs: HashSet<PathBuf> = HashSet::new();
+                for c_path in linked_c_files {
+                    let Some(c_dir) = c_path.parent() else { continue };
+                    let stem = c_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if !stem.is_empty() {
+                        let same_h = c_dir.join(format!("{}.h", stem));
+                        if let Ok(hc) = fs::canonicalize(&same_h) {
+                            push_linked(hc);
+                        }
+                    }
+                    if let Some(parent_dir) = c_dir.parent() {
+                        for inc_name in ["inc", "Inc", "include"] {
+                            let inc_dir = parent_dir.join(inc_name);
+                            if inc_dir.is_dir() {
+                                if !stem.is_empty() {
+                                    let sibling_h = inc_dir.join(format!("{}.h", stem));
+                                    if let Ok(hc) = fs::canonicalize(&sibling_h) {
+                                        push_linked(hc);
+                                    }
+                                }
+                                // If it's a compact protocol/middleware inc/ folder (<= 15 headers), include all its headers
+                                if scanned_inc_dirs.insert(inc_dir.clone()) {
+                                    if let Ok(rd) = fs::read_dir(&inc_dir) {
+                                        let hdrs: Vec<PathBuf> = rd
+                                            .flatten()
+                                            .map(|e| e.path())
+                                            .filter(|hp| {
+                                                hp.is_file()
+                                                    && hp.extension().and_then(|s| s.to_str()) == Some("h")
+                                            })
+                                            .collect();
+                                        if hdrs.len() <= 15 {
+                                            for hp in hdrs {
+                                                if let Ok(hc) = fs::canonicalize(&hp) {
+                                                    push_linked(hc);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1144,7 +1576,7 @@ fn extract_project_readme_summary(root_path: &Path) -> Option<String> {
     for name in ["readme.txt", "README.txt", "README.md", "readme.md"] {
         let p = root_path.join(name);
         if p.exists() {
-            if let Ok(txt) = fs::read_to_string(&p) {
+            if let Some(txt) = read_text_file_auto_encoding(&p) {
                 // Check for @brief or @par Example Description
                 let mut lines_out = Vec::new();
                 let mut in_desc = false;
@@ -1192,6 +1624,9 @@ where
     let mut target_files: Vec<(String, PathBuf, bool)> = Vec::new();
     let mut seen_disp = HashSet::new();
 
+    let is_zephyr_root =
+        root_path.join("west.yml").exists() && root_path.join("kernel").is_dir();
+
     if is_cherry_usb {
         let cherry_files = [
             "cherryusb_config_template.h",
@@ -1236,24 +1671,56 @@ where
                 target_files.push((f.to_string(), full, true));
             }
         }
+    } else if is_zephyr_root {
+        // Large Zephyr RTOS monorepo: prioritize core kernel/*.c + key kernel headers instead of arch/arc/
+        on_progress(
+            8,
+            "检测到 Zephyr RTOS 大型仓库，优先聚焦 kernel/ 核心调度与初始化链路...",
+            "提示：如需分析单个示例或驱动，可直接打开 samples/<app> 或 drivers/<mod> 子目录",
+        );
+        let priority_dirs = ["kernel", "kernel/include"];
+        for sub in priority_dirs {
+            let sub_path = root_path.join(sub);
+            if !sub_path.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&sub_path).max_depth(3).into_iter().flatten() {
+                if target_files.len() >= 90 {
+                    break;
+                }
+                if entry.file_type().is_file() {
+                    let p = entry.path();
+                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                        if matches!(ext, "c" | "h") {
+                            if let Ok(rel) = p.strip_prefix(root_path) {
+                                let disp = rel.to_string_lossy().replace('\\', "/");
+                                if !is_syscall_boilerplate_file_or_fn(&disp, "")
+                                    && seen_disp.insert(disp.clone())
+                                {
+                                    target_files.push((disp, p.to_path_buf(), true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
-        // 1. Scan all local .c/.h files inside root_path
-        for entry in WalkDir::new(root_path)
+        // 1. Scan all local .c/.h files inside root_path (prioritize .c/.cpp first, skip bloat dirs)
+        let mut c_files: Vec<(String, PathBuf)> = Vec::new();
+        let mut h_files: Vec<(String, PathBuf)> = Vec::new();
+        for (visited, entry) in WalkDir::new(root_path)
             .max_depth(5)
             .into_iter()
             .filter_entry(|e| {
-                let n = e.file_name().to_string_lossy();
-                !n.starts_with('.')
-                    && n != "node_modules"
-                    && n != "third_party"
-                    && n != "build"
-                    && n != "target"
-                    && n != "Exe"
-                    && n != "Obj"
+                e.depth() == 0
+                    || !e.file_type().is_dir()
+                    || !is_ignored_scan_dir(&e.file_name().to_string_lossy())
             })
             .flatten()
+            .enumerate()
         {
-            if target_files.len() >= 70 {
+            if visited > 4000 || (c_files.len() >= 60 && h_files.len() >= 30) {
                 break;
             }
             if entry.file_type().is_file() {
@@ -1262,28 +1729,38 @@ where
                     if matches!(ext, "c" | "cpp" | "h" | "hpp") {
                         if let Ok(rel) = p.strip_prefix(root_path) {
                             let disp = rel.to_string_lossy().replace('\\', "/");
-                            if !is_syscall_boilerplate_file_or_fn(&disp, "")
-                                && seen_disp.insert(disp.clone())
-                            {
-                                target_files.push((disp, p.to_path_buf(), true));
+                            if !is_syscall_boilerplate_file_or_fn(&disp, "") {
+                                if matches!(ext, "c" | "cpp") && c_files.len() < 60 {
+                                    c_files.push((disp, p.to_path_buf()));
+                                } else if matches!(ext, "h" | "hpp") && h_files.len() < 30 {
+                                    h_files.push((disp, p.to_path_buf()));
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        for (disp, full_path) in c_files.into_iter().chain(h_files.into_iter()) {
+            if target_files.len() >= 75 {
+                break;
+            }
+            if seen_disp.insert(disp.clone()) {
+                target_files.push((disp, full_path, true));
+            }
+        }
 
         // 2. Also discover linked SDK / HAL driver files from Keil .uvprojx / IAR .ewp!
         on_progress(10, "正在解析 Keil/IAR 工程外部驱动引用 (.uvprojx/.ewp)...", "");
         for (disp, full_path) in discover_ide_project_linked_files(root_path) {
-            if target_files.len() >= 110 {
+            if target_files.len() >= 160 {
                 break;
             }
             if (disp.ends_with(".c") || disp.ends_with(".h"))
                 && !is_syscall_boilerplate_file_or_fn(&disp, "")
                 && seen_disp.insert(disp.clone())
             {
-                let is_local = !disp.starts_with("Drivers/");
+                let is_local = !disp.starts_with("Drivers/") && !disp.contains("Libraries/");
                 target_files.push((disp, full_path, is_local));
             }
         }
@@ -1294,7 +1771,20 @@ where
     let mut msp_stack_source = "默认裸机主栈基准 (MSP Stack_Size = 0x0400 / 1024B)".to_string();
     let stack_equ_re =
         Regex::new(r"(?i)(?:Stack_Size\s+EQU|_Min_Stack_Size\s*=|size_of_stack\s*=)\s*(0x[0-9a-fA-F]+|\d+)").unwrap();
-    for entry in WalkDir::new(root_path).max_depth(3).into_iter().flatten() {
+    for (visited, entry) in WalkDir::new(root_path)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e.file_type().is_dir()
+                || !is_ignored_scan_dir(&e.file_name().to_string_lossy())
+        })
+        .flatten()
+        .enumerate()
+    {
+        if visited > 1500 {
+            break;
+        }
         if entry.file_type().is_file() {
             let ext = entry
                 .path()
@@ -1302,7 +1792,7 @@ where
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
             if matches!(ext, "s" | "S" | "ld" | "sct" | "icf") {
-                if let Ok(txt) = fs::read_to_string(entry.path()) {
+                if let Some(txt) = read_text_file_auto_encoding(entry.path()) {
                     if let Some(caps) = stack_equ_re.captures(&txt) {
                         let raw_val = &caps[1];
                         let parsed = if let Some(hex) = raw_val.strip_prefix("0x").or_else(|| raw_val.strip_prefix("0X")) {
@@ -1344,7 +1834,7 @@ where
             &format!("正在读取源码与宏定义 ({}/{})", idx + 1, total_files),
             disp,
         );
-        if let Ok(content) = fs::read_to_string(full_path) {
+        if let Some(content) = read_text_file_auto_encoding(full_path) {
             for caps in def_re.captures_iter(&content) {
                 let m_name = caps[1].to_string();
                 let m_raw = &caps[2];
@@ -1628,6 +2118,7 @@ where
                          kind: &str,
                          rel_type: &str,
                          label: Option<String>,
+                         registered_at: Option<String>,
                          line: usize,
                          expr: Option<String>,
                          conditions: Vec<String>| {
@@ -1643,6 +2134,7 @@ where
                 "kind": kind,
                 "relationType": rel_type,
                 "label": label,
+                "registeredAt": registered_at,
                 "callSiteLine": line,
                 "callSiteExpr": expr,
                 "conditions": if conditions.is_empty() { Value::Null } else { json!(conditions) },
@@ -1650,6 +2142,10 @@ where
             edge_seq += 1;
         }
     };
+
+    // Extract generic C struct ops-table definitions & bindings across all loaded .h/.c files
+    let (receiver_to_types, ops_bindings, field_only_types) =
+        extract_struct_ops_tables(&files_content, &parsed_funcs);
 
     for (name, pf) in &parsed_funcs {
         for fa in &pf.field_assignments {
@@ -1659,10 +2155,50 @@ where
                 "OPS_TABLE",
                 "BIND",
                 Some(format!(".{} = {}", fa.field, fa.target_fn)),
+                None,
                 fa.line,
                 Some(fa.expr.clone()),
                 fa.conditions.clone(),
             );
+        }
+        // Resolve indirect struct function-pointer calls (`phost->class_cb->Requests()`, `HID_Machine.cb->Decode()`, etc.)
+        for fc in &pf.field_calls {
+            let mut matched_types: Vec<String> = Vec::new();
+            if let Some(ts) = receiver_to_types.get(&fc.receiver) {
+                for t in ts {
+                    if ops_bindings.contains_key(&(t.clone(), fc.field.clone())) {
+                        matched_types.push(t.clone());
+                    }
+                }
+            }
+            // Safe unambiguous fallback: if receiver type wasn't directly resolved, match only when
+            // exactly ONE ops-table struct type defines this field name across the project.
+            if matched_types.is_empty() {
+                if let Some(ts) = field_only_types.get(&fc.field) {
+                    if ts.len() == 1 {
+                        if let Some(only_t) = ts.iter().next() {
+                            matched_types.push(only_t.clone());
+                        }
+                    }
+                }
+            }
+            for st_type in matched_types {
+                if let Some(bindings) = ops_bindings.get(&(st_type, fc.field.clone())) {
+                    for b in bindings {
+                        push_edge(
+                            name,
+                            &b.target_fn,
+                            "OPS_TABLE",
+                            "INVOKE_CB",
+                            Some(format!("{}->{}()", fc.receiver, fc.field)),
+                            Some(format!("{}:{} ({}.{})", b.file, b.line, b.var_name, fc.field)),
+                            fc.line,
+                            Some(fc.expr.clone()),
+                            fc.conditions.clone(),
+                        );
+                    }
+                }
+            }
         }
         for call in &pf.direct_calls {
             let callee = &call.callee;
@@ -1681,6 +2217,7 @@ where
                 } else {
                     None
                 },
+                None,
                 call.line,
                 Some(call.expr.clone()),
                 call.conditions.clone(),
@@ -1696,6 +2233,7 @@ where
                         "ASYNC_CALLBACK",
                         "BIND",
                         Some(format!("注册回调 ({})", callee)),
+                        None,
                         call.line,
                         Some(call.expr.clone()),
                         call.conditions.clone(),
@@ -1720,7 +2258,7 @@ where
             ("usbh_enumerate", "usbh_msc_connect", "OPS_TABLE", "INVOKE_CB", "CLASS_CONNECT (msc->connect)"),
         ];
         for (s, t, k, rt, lbl) in curated {
-            push_edge(s, t, k, rt, Some(lbl.to_string()), 1, Some(lbl.to_string()), Vec::new());
+            push_edge(s, t, k, rt, Some(lbl.to_string()), None, 1, Some(lbl.to_string()), Vec::new());
         }
     }
 
@@ -1968,8 +2506,18 @@ where
             for ch in nids.iter().skip(1) {
                 if matches!(
                     ch.as_str(),
-                    "HAL_Init" | "SystemClock_Config" | "MPU_Config" | "CPU_CACHE_Enable" | "Error_Handler"
-                ) {
+                    "HAL_Init"
+                        | "SystemClock_Config"
+                        | "MPU_Config"
+                        | "CPU_CACHE_Enable"
+                        | "Error_Handler"
+                        | "RCC_ClkConfiguration"
+                        | "USART_Config"
+                        | "UART_Config"
+                ) || ch.starts_with("RCC_")
+                    || ch.starts_with("USART_")
+                    || ch.starts_with("GPIO_")
+                {
                     secondary_q.push_back(ch.clone());
                 } else {
                     priority_q.push_back(ch.clone());
@@ -1978,7 +2526,7 @@ where
             priority_q.extend(secondary_q);
 
             while let Some(curr) = priority_q.pop_front() {
-                if nids.len() >= 30 {
+                if nids.len() >= 48 {
                     break;
                 }
                 if let Some(neighbors) = adj.get(&curr) {
@@ -1986,7 +2534,7 @@ where
                         if seen_m.insert(nxt.clone()) {
                             nids.push(nxt.clone());
                             priority_q.push_back(nxt.clone());
-                            if nids.len() >= 30 {
+                            if nids.len() >= 48 {
                                 break;
                             }
                         }
@@ -2076,7 +2624,7 @@ where
                     continue;
                 }
                 if nodes_map.contains_key(callee) {
-                    let sub_nids = collect_bfs(callee, 18);
+                    let sub_nids = collect_bfs(callee, 36);
                     if sub_nids.len() >= 2 {
                         let sub_eids = edges_for_nodes(&sub_nids);
                         let brief_str = nodes_map
@@ -2086,7 +2634,7 @@ where
                             .unwrap_or("");
                         let steps: Vec<Value> = sub_nids
                             .iter()
-                            .take(5)
+                            .take(6)
                             .enumerate()
                             .map(|(s_idx, nid)| {
                                 json!({
@@ -2113,6 +2661,65 @@ where
                         }));
                     }
                 }
+            }
+
+            // 2b. Promote rich ops-table class/protocol handlers sorted by subtree size (e.g. USBH_HID_Handle, USBH_HID_ClassRequest)
+            let mut ops_candidates: Vec<(String, String, Vec<String>)> = Vec::new();
+            let mut seen_ops_fn: HashSet<String> = HashSet::new();
+            for bindings in ops_bindings.values() {
+                for b in bindings {
+                    let tfn = &b.target_fn;
+                    if !seen_ops_fn.insert(tfn.clone())
+                        || entries_vec
+                            .iter()
+                            .any(|e| e.get("entryNodeId").and_then(|v| v.as_str()) == Some(tfn.as_str()))
+                    {
+                        continue;
+                    }
+                    let out_cnt = adj.get(tfn).map(|v| v.len()).unwrap_or(0);
+                    if out_cnt >= 2 {
+                        let sub_nids = collect_bfs(tfn, 28);
+                        if sub_nids.len() >= 3 {
+                            ops_candidates.push((tfn.clone(), b.var_name.clone(), sub_nids));
+                        }
+                    }
+                }
+            }
+            ops_candidates.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then_with(|| a.0.cmp(&b.0)));
+            for (tfn, var_name, sub_nids) in ops_candidates.into_iter().take(6) {
+                let sub_eids = edges_for_nodes(&sub_nids);
+                let brief_str = nodes_map
+                    .get(&tfn)
+                    .and_then(|v| v.get("brief"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("");
+                let steps: Vec<Value> = sub_nids
+                    .iter()
+                    .take(5)
+                    .enumerate()
+                    .map(|(s_idx, nid)| {
+                        json!({
+                            "id": format!("ops_{}_{}", tfn, s_idx),
+                            "stage": format!("类回调层级 {}", s_idx + 1),
+                            "title": format!("{}()", nid),
+                            "nodeId": nid,
+                            "detail": nodes_map.get(nid).and_then(|v| v.get("brief")).and_then(|x| x.as_str()).unwrap_or(""),
+                            "tag": "CALLBACK"
+                        })
+                    })
+                    .collect();
+                entries_vec.push(json!({
+                    "id": format!("entry_ops_{}", tfn),
+                    "name": tfn,
+                    "displayName": format!("{}() 协议类回调链路 ({})", tfn, var_name),
+                    "category": "PUBLIC_API",
+                    "entryNodeId": tfn,
+                    "summary": brief_str,
+                    "nodeIds": sub_nids,
+                    "edgeIds": sub_eids,
+                    "configMacros": config_macros_vec,
+                    "staticFlowOutline": steps,
+                }));
             }
         }
 
@@ -2214,7 +2821,7 @@ where
         "archBits": 32,
         "targetMcuHint": format!("Real Local Repo ({})", root_dir),
         "sourceKind": "LOCAL_WORKSPACE",
-        "runtimeParadigm": if is_cherry_usb { "HYBRID_OPTIONAL_OS" } else { "BARE_METAL" },
+        "runtimeParadigm": if is_zephyr_root { "RTOS" } else if is_cherry_usb { "HYBRID_OPTIONAL_OS" } else { "BARE_METAL" },
         "detectedMspStackBytes": detected_msp_stack_bytes,
         "mspStackSource": msp_stack_source,
         "fileIncludes": file_includes,
@@ -2300,4 +2907,56 @@ pub fn export_porting_bundle(payload: ExportPortingPayload) -> Result<Value, Str
         "copiedCount": copied_files.len(),
         "copiedFiles": copied_files,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mh242x_usb_host_hid() {
+        let p = r"D:\6_SVN\MH242x\开发资料\SDK\ModuleTest\USB_Host_Examples\HID";
+        if !Path::new(p).exists() {
+            return;
+        }
+        let res = analyze_local_c_project_with_progress(p, |_, _, _| {}).expect("analyze failed");
+        let files_len = res["files"].as_object().map(|m| m.len()).unwrap_or(0);
+        let nodes_len = res["nodes"].as_object().map(|m| m.len()).unwrap_or(0);
+        let edges = res["edges"].as_array().unwrap();
+        let entries = res["entries"].as_array().unwrap();
+        println!("FILES={} NODES={} EDGES={} ENTRIES={}", files_len, nodes_len, edges.len(), entries.len());
+        for e in entries {
+            println!(
+                "  ENTRY: {} ({} nodes, {} edges)",
+                e["displayName"].as_str().unwrap_or(""),
+                e["nodeIds"].as_array().map(|a| a.len()).unwrap_or(0),
+                e["edgeIds"].as_array().map(|a| a.len()).unwrap_or(0)
+            );
+        }
+        println!("--- INVOKE_CB EDGES ---");
+        for ed in edges {
+            if ed["relationType"].as_str() == Some("INVOKE_CB") {
+                println!(
+                    "  {} -> {} | {} | reg={} | conds={}",
+                    ed["source"].as_str().unwrap_or(""),
+                    ed["target"].as_str().unwrap_or(""),
+                    ed["label"].as_str().unwrap_or(""),
+                    ed["registeredAt"].as_str().unwrap_or(""),
+                    ed["conditions"]
+                );
+            }
+        }
+        assert!(res["nodes"].get("main").is_some(), "main() must be parsed from GBK main.c");
+        assert!(res["nodes"].get("USBH_Init").is_some(), "USBH_Init must be parsed (6-line header)");
+        assert!(res["nodes"].get("USBH_Process").is_some(), "USBH_Process must be parsed");
+        assert!(res["nodes"].get("USBH_HID_ClassRequest").is_some(), "USBH_HID_ClassRequest must be parsed");
+        assert!(
+            edges.iter().any(|e| e["source"] == "USBH_Process" && e["target"] == "USBH_HID_ClassRequest"),
+            "USBH_Process -> USBH_HID_ClassRequest INVOKE_CB edge must exist!"
+        );
+        assert!(
+            edges.iter().any(|e| e["source"] == "USBH_Process" && e["target"] == "USBH_HID_Handle"),
+            "USBH_Process -> USBH_HID_Handle INVOKE_CB edge must exist!"
+        );
+    }
 }

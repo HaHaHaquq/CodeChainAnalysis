@@ -19,7 +19,7 @@ export type EdgeRelationType =
   | "INVOKE_CB"
   | "WEAK_HOOK";
 
-export type ViewMode = "CANVAS" | "SWIMLANE" | "SEQUENCE";
+export type ViewMode = "STORY" | "CANVAS" | "SWIMLANE" | "SEQUENCE";
 
 /**
  * Project-level and feature-level execution paradigm:

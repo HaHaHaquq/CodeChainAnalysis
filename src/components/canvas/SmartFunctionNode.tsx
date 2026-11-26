@@ -43,14 +43,14 @@ export const SmartFunctionNode: React.FC<NodeProps> = memo(({ data }) => {
   const globalCount = new Set([...fn.readsGlobals, ...fn.writesGlobals]).size;
 
   const borderStyle = isRecursionNode
-    ? "border-purple-400 shadow-[0_0_24px_rgba(192,132,252,0.45)]"
+    ? "border-[#a58cc9]/70 shadow-[0_6px_20px_rgba(165,140,201,0.18)]"
     : heatmapEnabled && isOnCriticalStackPath
-    ? "border-red-500 shadow-[0_0_24px_rgba(239,68,68,0.48)]"
+    ? "border-[#c9858d]/80 shadow-[0_6px_20px_rgba(201,133,141,0.2)]"
     : isSelected
-    ? "border-cyan-400 shadow-[0_0_22px_rgba(34,211,238,0.35)]"
+    ? "border-[#7b9acc]/80 shadow-[0_6px_22px_rgba(123,154,204,0.22)]"
     : isLargeStack
-    ? "border-orange-500/70 shadow-[0_0_16px_rgba(249,115,22,0.22)]"
-    : "border-slate-700/80 hover:border-slate-500";
+    ? "border-[#d2a266]/55"
+    : "border-slate-300/12 hover:border-slate-300/28";
 
   const sourcePos = viewMode === "SWIMLANE" ? Position.Bottom : Position.Right;
   const targetPos = viewMode === "SWIMLANE" ? Position.Top : Position.Left;
@@ -66,16 +66,16 @@ export const SmartFunctionNode: React.FC<NodeProps> = memo(({ data }) => {
         selectNode(fn.id, true);
       }}
       style={{ width: 286, opacity: isDimmed ? 0.34 : 1 }}
-      className={`group relative rounded-xl border bg-[#0d1424]/95 backdrop-blur-md transition-all duration-200 select-none ${borderStyle}`}
+      className={`group relative rounded-xl border bg-[#141b26]/95 backdrop-blur-md transition-all duration-200 select-none ${borderStyle}`}
     >
       {/* Top accent bar */}
       <div
-        className="h-1 w-full rounded-t-[11px]"
+        className="h-[3px] w-full rounded-t-[11px]"
         style={{
           backgroundColor: isRecursionNode
-            ? "#c084fc"
+            ? "#a58cc9"
             : heatmapEnabled && isOnCriticalStackPath
-            ? "#ef4444"
+            ? "#c9858d"
             : meta.accentColor,
         }}
       />
@@ -83,12 +83,12 @@ export const SmartFunctionNode: React.FC<NodeProps> = memo(({ data }) => {
       <Handle
         type="target"
         position={targetPos}
-        className="!h-2.5 !w-2.5 !border-2 !border-slate-900 !bg-cyan-400"
+        className="!h-2 !w-2 !border-2 !border-[#141b26] !bg-[#7b9acc]"
       />
       <Handle
         type="source"
         position={sourcePos}
-        className="!h-2.5 !w-2.5 !border-2 !border-slate-900 !bg-emerald-400"
+        className="!h-2 !w-2 !border-2 !border-[#141b26] !bg-[#69ad99]"
       />
 
       {/* Card Body */}
@@ -188,16 +188,16 @@ export const SmartFunctionNode: React.FC<NodeProps> = memo(({ data }) => {
                 fn.stackWarnings?.join("；") ||
                 `静态估算本地栈帧消耗约 ${fn.stackBytes} Bytes`
               }
-              className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+              className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-mono text-[10px] font-medium ${
                 isLargeStack
-                  ? "bg-red-500/20 text-red-300 border border-red-500/50"
-                  : "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
+                  ? "bg-[#c9858d]/15 text-[#e3a8af] border border-[#c9858d]/35"
+                  : "bg-[#69ad99]/12 text-[#95c9b9] border border-[#69ad99]/25"
               }`}
             >
               {isLargeStack ? (
-                <Flame className="h-3 w-3 text-red-400" />
+                <Flame className="h-3 w-3 text-[#c9858d]" />
               ) : (
-                <Cpu className="h-3 w-3 text-emerald-400" />
+                <Cpu className="h-3 w-3 text-[#69ad99]" />
               )}
               ~{fn.stackBytes}B
             </span>

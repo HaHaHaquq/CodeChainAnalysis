@@ -121,7 +121,7 @@ const ChainCanvasInner: React.FC<ChainCanvasInnerProps> = ({ stackMetrics }) => 
   );
 
   return (
-    <div className="h-full w-full relative bg-[#070b13]">
+    <div className="h-full w-full relative bg-[#0e131a]">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -138,15 +138,15 @@ const ChainCanvasInner: React.FC<ChainCanvasInnerProps> = ({ stackMetrics }) => 
       >
         <Background
           variant={BackgroundVariant.Dots}
-          gap={22}
-          size={1.2}
-          color="#1e293b"
+          gap={24}
+          size={1.1}
+          color="#1d2736"
         />
         <Controls position="bottom-left" className="!mb-4 !ml-4" />
         <MiniMap
           position="bottom-left"
           className="!mb-4 !ml-16 !h-28 !w-44"
-          maskColor="rgba(7, 11, 19, 0.72)"
+          maskColor="rgba(14, 19, 26, 0.72)"
           nodeColor={(n) => {
             if (n.type === "swimlaneBand") return "transparent";
             const layer =
@@ -156,30 +156,30 @@ const ChainCanvasInner: React.FC<ChainCanvasInnerProps> = ({ stackMetrics }) => 
         />
       </ReactFlow>
 
-      {/* Bottom Interactive Legend & Bind-Edge Filter Pill */}
-      <div className="pointer-events-auto absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 rounded-full border border-white/10 bg-slate-950/85 px-4 py-1.5 text-[11px] text-slate-300 backdrop-blur-xl shadow-xl">
+      {/* Bottom Interactive Legend & Bind-Edge Filter Pill (Morandi-Slate) */}
+      <div className="pointer-events-auto absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 rounded-full border border-slate-300/12 bg-[#141b26]/92 px-4 py-1.5 text-[11px] text-[#9aa7b8] backdrop-blur-xl shadow-lg">
         <span className="inline-flex items-center gap-1.5">
-          <span className="h-0.5 w-4 bg-slate-400" /> 直接调用
+          <span className="h-0.5 w-4 bg-[#62748c]" /> 直接调用
         </span>
-        <span className="inline-flex items-center gap-1.5 text-cyan-300">
-          <span className="h-0.5 w-4 border-t-2 border-dashed border-cyan-400" /> 📌 指针绑定
+        <span className="inline-flex items-center gap-1.5 text-[#9ed0dc]">
+          <span className="h-0.5 w-4 border-t-2 border-dashed border-[#68a8b8]" /> 指针绑定
         </span>
-        <span className="inline-flex items-center gap-1.5 text-orange-300">
-          <span className="h-0.5 w-4 border-t-2 border-dashed border-orange-400" /> ⚡ 异步回调
+        <span className="inline-flex items-center gap-1.5 text-[#e6c494]">
+          <span className="h-0.5 w-4 border-t-2 border-dashed border-[#d2a266]" /> 异步回调
         </span>
-        <span className="inline-flex items-center gap-1.5 text-purple-300">
-          <span className="h-0.5 w-4 border-t-2 border-dashed border-purple-400" /> 🟣 __weak
+        <span className="inline-flex items-center gap-1.5 text-[#d2c6ed]">
+          <span className="h-0.5 w-4 border-t-2 border-dashed border-[#a58cc9]" /> __weak
         </span>
-        <span className="border-l border-white/15 pl-3 text-slate-400">
-          💡 单击任意连线可透视分支条件与调用现场源码
+        <span className="border-l border-slate-300/12 pl-3 text-[#7c8a9e]">
+          单击连线可查看分支条件与调用现场源码
         </span>
         <button
           type="button"
           onClick={toggleShowBindEdges}
-          className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+          className={`rounded-full border px-2.5 py-0.5 text-[10px] font-medium transition-colors cursor-pointer ${
             showBindEdges
-              ? "border-cyan-500/40 bg-cyan-500/15 text-cyan-200 hover:bg-cyan-500/25"
-              : "border-white/10 bg-slate-800 text-slate-400 hover:text-white"
+              ? "border-[#68a8b8]/40 bg-[#68a8b8]/14 text-[#b4dae3] hover:bg-[#68a8b8]/22"
+              : "border-slate-300/12 bg-[#101620] text-[#7c8a9e] hover:text-[#dce4ee]"
           }`}
           title="切换显示/隐藏仅赋值绑定函数指针的边，让主干执行流更清爽"
         >

@@ -13,8 +13,8 @@
     height: 100%;
     margin: 0;
     padding: 0;
-    background-color: #070b13;
-    color: #e2e8f0;
+    background-color: #0e131a;
+    color: #e6edf3;
     font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
   }
 }
@@ -78,15 +78,15 @@
 }
 
 .edge-heatmap-glow path.react-flow__edge-path {
-  filter: drop-shadow(0 0 6px rgba(239, 68, 68, 0.85));
+  filter: drop-shadow(0 0 3px rgba(201, 133, 141, 0.55));
 }
 
 .edge-recursion-glow path.react-flow__edge-path {
-  filter: drop-shadow(0 0 6px rgba(192, 132, 252, 0.9));
+  filter: drop-shadow(0 0 3px rgba(165, 140, 201, 0.55));
 }
 
 /* Monaco highlighted line */
 .chain-monaco-active-line {
-  background: rgba(34, 211, 238, 0.14) !important;
-  border-left: 3px solid #22d3ee !important;
+  background: rgba(123, 154, 204, 0.14) !important;
+  border-left: 3px solid #7b9acc !important;
 }

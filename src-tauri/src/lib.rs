@@ -40,21 +40,50 @@ fn export_porting_package(payload: ExportPortingPayload) -> Result<Value, String
 }
 
 #[tauri::command]
-fn open_standalone_drawer(app: tauri::AppHandle) -> Result<(), String> {
+async fn open_standalone_drawer(
+    app: tauri::AppHandle,
+    repo_path: Option<String>,
+) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("drawer_popup") {
         let _ = win.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(
-        &app,
-        "drawer_popup",
-        WebviewUrl::App("index.html?standalone=drawer".into()),
-    )
-    .title("ChainAnalysis — 独立源码与移植分析副窗口")
-    .inner_size(780.0, 920.0)
-    .min_inner_size(420.0, 500.0)
-    .build()
-    .map_err(|e| e.to_string())?;
+    let url_str = match repo_path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(repo) => {
+            let encoded = repo
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{:02X}", b),
+                })
+                .collect::<String>();
+            format!("index.html?standalone=drawer&repo={}", encoded)
+        }
+        None => "index.html?standalone=drawer".to_string(),
+    };
+    let app_handle = app.clone();
+    let win = WebviewWindowBuilder::new(&app, "drawer_popup", WebviewUrl::App(url_str.into()))
+        .title("ChainAnalysis — 独立源码与移植分析副窗口")
+        .inner_size(780.0, 920.0)
+        .min_inner_size(420.0, 500.0)
+        .build()
+        .map_err(|e| e.to_string())?;
+    win.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = app_handle.emit("drawer-window-closed", ());
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn close_standalone_drawer(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("drawer_popup") {
+        let _ = win.destroy();
+    }
+    let _ = app.emit("drawer-window-closed", ());
     Ok(())
 }
 
@@ -66,7 +95,8 @@ pub fn run() {
             get_engine_status,
             analyze_c_project,
             export_porting_package,
-            open_standalone_drawer
+            open_standalone_drawer,
+            close_standalone_drawer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

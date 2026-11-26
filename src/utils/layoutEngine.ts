@@ -28,36 +28,36 @@ export const SWIMLANE_META: Record<
     subtitle: "RTOS Tasks / Main Loop / 顶层业务调度",
     badge: "APP",
     portingHint: "参考调用方式，按需接入新工程业务",
-    accentColor: "#818cf8",
-    bgClass: "bg-indigo-950/20",
-    borderClass: "border-indigo-500/25",
+    accentColor: "#859ce0",
+    bgClass: "bg-[#171f31]/40",
+    borderClass: "border-[#859ce0]/20",
   },
   CORE: {
     title: "L2 · 核心模块与协议层 (Middleware / Core)",
     subtitle: "算法 / 状态机 / 协议解析 / 缓冲区",
     badge: "CORE",
-    portingHint: "📦 核心搬迁区（原样打包拷贝至新工程）",
-    accentColor: "#34d399",
-    bgClass: "bg-emerald-950/20",
-    borderClass: "border-emerald-500/25",
+    portingHint: "核心协议区（通常可整体复用）",
+    accentColor: "#69ad99",
+    bgClass: "bg-[#152424]/40",
+    borderClass: "border-[#69ad99]/20",
   },
   CALLBACK: {
     title: "L3 · 事件与回调总线 (Callback / Event Bus)",
     subtitle: "异步回调 / __weak 钩子 / 命令表处理器",
     badge: "CALLBACK",
-    portingHint: "⚡ 异步解耦桥梁（确认回调注册与触发时序）",
-    accentColor: "#fbbf24",
-    bgClass: "bg-amber-950/20",
-    borderClass: "border-amber-500/25",
+    portingHint: "异步解耦桥梁（确认回调注册与触发时序）",
+    accentColor: "#d2a266",
+    bgClass: "bg-[#241f18]/40",
+    borderClass: "border-[#d2a266]/20",
   },
   HAL: {
     title: "L4 · 硬件抽象与驱动层 (HAL / BSP / OS)",
-    subtitle: "芯片外设驱动 / 中断向量 / FreeRTOS API",
+    subtitle: "芯片外设驱动 / 中断向量 / OS 原语",
     badge: "HAL",
-    portingHint: "🔌 移植替换边界（跨芯片必须重写或适配！）",
-    accentColor: "#fb7185",
-    bgClass: "bg-rose-950/25",
-    borderClass: "border-rose-500/30",
+    portingHint: "硬件适配边界（跨芯片需按板级调整）",
+    accentColor: "#c9858d",
+    bgClass: "bg-[#261a1f]/40",
+    borderClass: "border-[#c9858d]/20",
   },
 };
 
@@ -270,6 +270,7 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
   const getNodeHeight = (id: string) => (expandedSnippetIds[id] ? 236 : 122);
 
   const rfNodes: Node[] = [];
+  const dagreWaypoints = new Map<string, Array<{ x: number; y: number }>>();
 
   if (viewMode === "CANVAS") {
     // Dagre hierarchical left-to-right layout for spatial canvas
@@ -278,8 +279,9 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
     g.setDefaultEdgeLabel(() => ({}));
     g.setGraph({
       rankdir: "LR",
-      nodesep: 58,
-      ranksep: 225,
+      nodesep: 68,
+      ranksep: 240,
+      edgesep: 32,
       marginx: 50,
       marginy: 50,
     });
@@ -293,6 +295,16 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
       }
     }
     dagre.layout(g);
+
+    // Save Dagre obstacle-avoiding waypoints for cross-rank edges
+    for (const e of visibleEdges) {
+      if (!recursionEdges.has(e.id)) {
+        const de = g.edge(e.source, e.target);
+        if (de && Array.isArray(de.points) && de.points.length >= 2) {
+          dagreWaypoints.set(e.id, de.points.map((pt) => ({ x: pt.x, y: pt.y })));
+        }
+      }
+    }
 
     for (const id of visibleNodeIds) {
       const fn = allNodes[id];
@@ -318,6 +330,7 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
         id,
         type: "smartFunction",
         position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - h / 2 },
+        zIndex: id === selectedNodeId ? 25 : 20,
         data: payload,
       });
     }
@@ -388,12 +401,19 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
           id,
           type: "smartFunction",
           position: { x: 64 + colIdx * colSpacing, y: bandTopY + yOffset },
-          zIndex: 10,
+          zIndex: id === selectedNodeId ? 25 : 20,
           data: payload,
         });
       });
     });
   }
+
+  // Track incoming-edge index per target so multi-parent badges never stack on top of each other
+  const targetInTotals = new Map<string, number>();
+  for (const e of visibleEdges) {
+    targetInTotals.set(e.target, (targetInTotals.get(e.target) ?? 0) + 1);
+  }
+  const targetInCursor = new Map<string, number>();
 
   // Build interactive semantic edges using custom InteractiveCallEdge
   const rfEdges: Edge[] = visibleEdges.map((e) => {
@@ -401,45 +421,48 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
     const isRecursion = recursionEdges.has(e.id);
     const isSelected = e.id === selectedEdgeId;
     const isOnSelectedPath = highlightedEdgeSet.has(e.id);
+    const inIndex = targetInCursor.get(e.target) ?? 0;
+    targetInCursor.set(e.target, inIndex + 1);
+    const inTotal = targetInTotals.get(e.target) ?? 1;
 
-    let stroke = "#64748b";
-    let strokeWidth = 1.9;
+    let stroke = "#5c6d84";
+    let strokeWidth = 1.75;
     let strokeDasharray: string | undefined = undefined;
     let animated = false;
     let className = "";
 
     if (isSelected) {
-      stroke = "#38bdf8";
-      strokeWidth = 3.4;
+      stroke = "#7b9acc";
+      strokeWidth = 3.0;
       animated = true;
     } else if (isOnSelectedPath) {
-      stroke = "#22d3ee";
-      strokeWidth = 2.8;
+      stroke = "#8eb0e0";
+      strokeWidth = 2.4;
       animated = true;
     } else if (isRecursion) {
-      stroke = "#c084fc";
-      strokeWidth = 2.8;
+      stroke = "#a58cc9";
+      strokeWidth = 2.4;
       strokeDasharray = "6 4";
       animated = true;
       className = "edge-recursion-glow";
     } else if (isCritical) {
-      stroke = "#ef4444";
-      strokeWidth = 3.2;
+      stroke = "#c9858d";
+      strokeWidth = 2.8;
       animated = true;
       className = "edge-heatmap-glow";
     } else if (e.kind === "ASYNC_CALLBACK" || e.relationType === "INVOKE_CB") {
-      stroke = "#fb923c";
-      strokeWidth = 2.3;
+      stroke = "#d2a266";
+      strokeWidth = 2.0;
       strokeDasharray = "6 4";
       className = "edge-callback-animated";
     } else if (e.kind === "OPS_TABLE" || e.relationType === "BIND") {
-      stroke = "#22d3ee";
-      strokeWidth = 2.0;
+      stroke = "#68a8b8";
+      strokeWidth = 1.85;
       strokeDasharray = "5 4";
       className = "edge-callback-animated";
     } else if (e.kind === "WEAK_OVERRIDE") {
-      stroke = "#a855f7";
-      strokeWidth = 2.2;
+      stroke = "#a58cc9";
+      strokeWidth = 2.0;
       strokeDasharray = "4 4";
     }
 
@@ -454,7 +477,8 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
       type: "interactiveCall",
       animated,
       className,
-      zIndex: isSelected ? 30 : isOnSelectedPath ? 20 : 5,
+      // Always keep edges strictly below function node cards (zIndex 20/25) so lines never cover card text
+      zIndex: isSelected ? 10 : isOnSelectedPath ? 8 : 2,
       data: {
         edgeData: e,
         isSelected,
@@ -464,6 +488,9 @@ export function buildReactFlowGraph(params: BuildGraphParams): {
         dimmed,
         strokeColor: stroke,
         viewMode,
+        waypoints: dagreWaypoints.get(e.id),
+        inIndex,
+        inTotal,
       },
       style: {
         stroke,

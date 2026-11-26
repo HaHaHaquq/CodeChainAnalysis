@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo } from "react";
-import { useChainStore } from "./store/useChainStore";
+import { listen } from "@tauri-apps/api/event";
+import { isTauriDesktop, useChainStore } from "./store/useChainStore";
 import {
   buildAiPortingPrompt,
   buildPortingAdapterSkeleton,
@@ -8,6 +9,7 @@ import {
 } from "./utils/graphMetrics";
 import { ChainCanvas } from "./components/canvas/ChainCanvas";
 import { SequenceTimelineView } from "./components/canvas/SequenceTimelineView";
+import { StoryGuideView } from "./components/canvas/StoryGuideView";
 import { TopTelemetryBar } from "./components/hud/TopTelemetryBar";
 import { FeatureSelectorHud } from "./components/hud/FeatureSelectorHud";
 import { RightAnalysisDrawer } from "./components/drawer/RightAnalysisDrawer";
@@ -39,10 +41,45 @@ export function App() {
     );
   }, []);
 
-  // Auto-load real local CherryUSB-1.6.1 repository on startup
+  const initialRepoFromUrl = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    return new URLSearchParams(window.location.search).get("repo");
+  }, []);
+
+  // Auto-load target repo on startup (standalone drawer inherits main window's repo!)
   useEffect(() => {
-    loadLocalProject("D:\\3-code\\USB\\CherryUSB-1.6.1");
-  }, [loadLocalProject]);
+    const targetRepo =
+      initialRepoFromUrl && initialRepoFromUrl.trim()
+        ? initialRepoFromUrl.trim()
+        : "D:\\3-code\\USB\\CherryUSB-1.6.1";
+    loadLocalProject(targetRepo).then(() => {
+      if (isStandaloneDrawerWindow) {
+        try {
+          const ch = new BroadcastChannel("chain_analysis_sync_v1");
+          ch.postMessage({ type: "REQUEST_STATE" });
+          ch.close();
+        } catch {
+          // ignore
+        }
+      }
+    });
+  }, [loadLocalProject, initialRepoFromUrl, isStandaloneDrawerWindow]);
+
+  // Listen to native Tauri event when detached drawer window is closed via OS X button
+  useEffect(() => {
+    if (isStandaloneDrawerWindow || !isTauriDesktop()) return;
+    let unlisten: (() => void) | null = null;
+    listen("drawer-window-closed", () => {
+      useChainStore.getState().applyRemoteSync({ type: "POPUP_CLOSED" });
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [isStandaloneDrawerWindow]);
 
   // If this is the popped-out standalone drawer window, notify main window when closed
   useEffect(() => {
@@ -121,7 +158,7 @@ export function App() {
   // Standalone Pop-Out Window Mode: 100% dedicated to Source Reader, Porting Checklist & Flow Outline
   if (isStandaloneDrawerWindow) {
     return (
-      <main className="h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
+      <main className="h-screen w-screen overflow-hidden bg-[#0e131a] text-[#e6edf3]">
         <RightAnalysisDrawer
           activeEntry={activeEntry}
           stackMetrics={stackMetrics}
@@ -147,8 +184,8 @@ export function App() {
   }
 
   return (
-    <main className="relative flex h-screen w-screen overflow-hidden bg-[#070b13] text-slate-100">
-      {/* Top Floating Telemetry & 3-Way View Switcher */}
+    <main className="relative flex h-screen w-screen overflow-hidden bg-[#0e131a] text-[#e6edf3]">
+      {/* Top Floating Telemetry & View Switcher */}
       <TopTelemetryBar
         stackMetrics={stackMetrics}
         porting={portingBoundary}
@@ -156,7 +193,9 @@ export function App() {
 
       {/* Left / Center Canvas Area (automatically expands when right panel is closed, detached, or resized in SPLIT mode!) */}
       <div className="relative flex-1 h-full min-w-0 overflow-hidden">
-        {viewMode === "SEQUENCE" ? (
+        {viewMode === "STORY" ? (
+          <StoryGuideView activeEntry={activeEntry} />
+        ) : viewMode === "SEQUENCE" ? (
           <SequenceTimelineView
             activeEntry={activeEntry}
             stackMetrics={stackMetrics}
