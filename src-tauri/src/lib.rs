@@ -1,9 +1,14 @@
 pub mod analyzer;
+pub mod c_ast;
+pub mod callback_flow;
+pub mod clangd_bridge;
+pub mod project_db;
 
 use analyzer::{
     analyze_local_c_project_with_progress, export_porting_bundle, ExportPortingPayload,
 };
 use serde_json::{json, Value};
+use std::path::Path;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
@@ -37,6 +42,32 @@ async fn analyze_c_project(app: tauri::AppHandle, path: String) -> Result<Value,
 #[tauri::command]
 fn export_porting_package(payload: ExportPortingPayload) -> Result<Value, String> {
     export_porting_bundle(payload)
+}
+
+#[tauri::command]
+fn get_project_compile_db(path: String, target_index: Option<usize>) -> Result<Value, String> {
+    let model = project_db::discover_project_model(Path::new(&path));
+    Ok(json!({
+        "sourceKind": model.source_kind,
+        "activeTargetIndex": model.active_target_index,
+        "targets": model.targets.iter().map(|t| json!({
+            "name": t.name,
+            "compilerFlavor": t.compiler_flavor.as_str(),
+            "sourcesCount": t.sources.len(),
+            "includeDirsCount": t.include_dirs.len(),
+            "definesCount": t.defines.len(),
+            "excludedFilesCount": t.excluded_files.len(),
+        })).collect::<Vec<_>>(),
+        "compileCommands": model.build_compile_commands(target_index),
+    }))
+}
+
+#[tauri::command]
+fn get_clangd_status(
+    project_path: Option<String>,
+    custom_clangd_path: Option<String>,
+) -> Value {
+    clangd_bridge::probe_clangd_environment(project_path.as_deref(), custom_clangd_path.as_deref())
 }
 
 #[tauri::command]
@@ -95,6 +126,8 @@ pub fn run() {
             get_engine_status,
             analyze_c_project,
             export_porting_package,
+            get_project_compile_db,
+            get_clangd_status,
             open_standalone_drawer,
             close_standalone_drawer
         ])

@@ -1,11 +1,12 @@
-# ChainAnalysis — 嵌入式 C/C++ 源码调用链、隐式回调、堆栈体检与移植边界分析上位机
+# ChainAnalysis v0.7.1 — 嵌入式 C/C++ 源码调用链、多重异步回调、堆栈体检与移植边界分析上位机
 
 <p align="center">
   <img src="public/logo.svg" width="96" height="96" alt="ChainAnalysis Logo" />
 </p>
 
 > **核心定位**：一款专为**嵌入式研发工程师**打造的源码学习、架构梳理与跨平台代码迁移（Porting）辅助桌面上位机。
-> **核心哲学**：**0 编译环境依赖**（残缺工程或缺头文件也能秒级静态解析）、**0 强制 AI API Key 绑定**（纯静态 AST 与图算法 100% 离线可用 + 一键生成 AI 深度移植 Prompt）、**以“业务功能”为视角**还原完整调用链、隐式回调、最坏栈深（WCS）以及跨芯片移植依赖边界。
+> **核心哲学**：**0 编译环境依赖**（残缺工程或缺头文件也能秒级静态解析）、**0 强制 AI API Key 绑定**（纯静态 AST 与图算法 100% 离线可用 + 一键生成 AI 深度移植 Prompt）、**以“业务功能”为视角**还原完整调用链、多重异步回调、最坏栈深（WCS）以及跨芯片移植依赖边界。
+> **📖 核心解析思路与实现方法技术文档**：详见 [README_zh.md](./README_zh.md)（完整拆解 v0.7.1 三阶段解析基座：Keil/IAR/Makefile/GCC 工程上下文、`tree-sitter-c` AST + `#ifdef` 裁剪、多重异步回调不动点追踪、以及可选 `clangd` LSP 语义增强）。
 
 ---
 
@@ -37,10 +38,10 @@
 - 🎛️ **命令表与状态跳转表 (`CMD_TABLE`)**：识别 CLI/Shell 命令表（如 `lsusb`、AT 指令表）挂载的入口。
 - 🎯 **全库搜索与任意函数自定义建链**：支持在左上角搜索全库任意函数，一键**向上追溯调用/触发它的父函数 + 向下展开全部子调用与回调树**。
 
-### 2. C 语言 3 类“隐式回调”自动缝合引擎
-除了普通直接函数调用（实线），专门针对嵌入式 C 语言常用的 3 种解耦套路建立**发光彩色虚线**：
-- 🔌 **结构体函数指针 / 驱动接口表 (`[OPS_TABLE]` · 青色虚线)**：自动扫描 `.field = func` 与 `ptr->field = func` 赋值，并与 `->field()` 调用点跨文件自动配对（如 `s_flash_ops->write()` ➔ `BSP_Flash_Program`、`intf->class_interface_handler()` ➔ `cdc_acm_class_interface_request_handler`）。
-- ⚡ **异步回调注册 (`[ASYNC_CALLBACK]` · 橙色虚线)**：识别将函数名作为实参传递的注册行为（如 `usbd_add_endpoint`、`BSP_UART_RegisterRxCallback`），将底层中断/事件触发点与用户回调函数连接成闭环。
+### 2. C 语言 3 类“隐式回调”与多重异步回调自动缝合引擎（v0.7.1 升级）
+除了普通直接函数调用（实线），专门针对嵌入式 C 语言常用的 3 种解耦套路与多层异步注册建立**发光彩色虚线**（完整算法详见 [README_zh.md](./README_zh.md)）：
+- 🔌 **结构体函数指针 / 驱动接口表 (`[OPS_TABLE]` · 青色虚线)**：自动扫描 `.field = func`、顺序/指定结构体初始化与 `ptr->field = func` 赋值，并与 `->field()` 调用点跨文件自动配对（如 `s_flash_ops->write()` ➔ `BSP_Flash_Program`、`phost->class_cb->Machine()` ➔ `USBH_HID_Handle`）。
+- ⚡ **多重异步回调数据流追踪 (`[ASYNC_CALLBACK]` · 橙色虚线)**：基于 `tree-sitter-c` AST 与 4 级槽位不动点传播（`callback_flow.rs`），自动追踪**多层封装注册**（如 `main → drv_register_rx → dma_ll_bind_rx → g_bus.rx_cb`）、**配置结构体槽位拷贝**（如 `ep->ep_cb → rx_msg[ep].cb`）以及**回调内再注册二级回调**的嵌套异步链，并在边上完整标注多跳注册溯源路径。
 - 🟣 **弱函数覆盖 (`[WEAK_OVERRIDE]` · 紫色虚线)**：识别 `__WEAK` / `__weak` 符号（如 STM32 HAL 库回调或 CherryUSB 的 `__WEAK usbd_msc_sector_read`），自动关联重写点并标记为移植钩子。
 
 ### 3. 裸机 (Bare-Metal) vs RTOS 自动探测 + 最坏峰值栈深 (WCS) 分析
@@ -82,7 +83,7 @@
 | 层级 | 采用框架 / 工具库 | 版本 | 核心职责与选型优势 |
 | :--- | :--- | :---: | :--- |
 | **桌面上位机框架** | **Tauri 2.0** (`tauri`, `tauri-plugin-dialog`) | `2.12` | 原生 Windows WebView2 渲染，体积小、启动快、支持原生多窗口联动与系统级文件夹选择框，无 CMD 黑窗 |
-| **后端静态解析引擎** | **Rust** (`regex`, `walkdir`, `serde_json`, `OnceLock`) | `1.98` | 异步工作线程 (`spawn_blocking`) 毫秒级扫描本地 `.c/.cpp/.h`，提取 AST 函数、局部变量栈大小、`#include` 闭包并实时推送解析进度事件 |
+| **后端三阶段解析引擎** | **Rust** (`roxmltree`, `tree-sitter-c`, `encoding_rs`, `walkdir`, `serde_json`, LSP JSON-RPC) | `1.98` | 阶段 1 统一工程上下文（Keil/IAR/Makefile/GCC/`compile_commands.json`）+ 阶段 2 `tree-sitter-c` AST / 保行号 `#ifdef` 裁剪 / 多重异步回调追踪 + 阶段 3 可选 `clangd` LSP 语义增强（无 `clangd` 自动无感降级） |
 | **前端 UI 框架** | **React + TypeScript + Vite** | `19.1` / `6.4` | 组件化响应式开发，同时支持 Tauri 桌面端独立运行与本地 Web (`localhost:1420`) 预览 |
 | **样式与视觉设计** | **TailwindCSS v4 + Lucide Icons** | `4.1` | Apple 深空黑 + 液态铂金银金属质感徽标、毛玻璃 (`backdrop-blur`) HUD 悬浮面板 |
 | **图可视化与自动布局** | **React Flow (`@xyflow/react`) + Dagre (`@dagrejs/dagre`)** | `12.6` / `1.1` | 高性能自定义函数卡片、动态流动回调虚线、Dagre 宽间距自动分层布局与四层架构泳道拖拽交互 |
@@ -102,15 +103,15 @@ flowchart TB
         RightDrawer["右侧三合一分析工作台 (支持：分屏固定 / 自由拉宽 / ↗ 弹出独立副窗口双屏联动)<br/>Tab1: 移植边界 & 堆栈体检  |  Tab2: 静态执行思路大纲  |  Tab3: Monaco C源码联动 & 上下游跳转"]
     end
 
-    subgraph RustCore["Rust 静态解析与移植打包核心 (src-tauri/src/analyzer.rs)"]
-        Scanner["目录与宏/启动文件扫描器<br/>walkdir 扫描 .c/.h + startup.s Stack_Size 读取"]
-        Parser["C/C++ 函数与栈帧解析器<br/>提取函数体、局部变量/大数组栈消耗、switch状态机、Heap调用"]
-        Linker["调用链与隐式回调缝合器<br/>直接调用 + 结构体 .field=fn 接口表 + 注册回调传参 + __WEAK 重写"]
-        Exporter["独立移植包导出器<br/>递归归集 #include 头文件闭包 + 生成 port_adapter.c + 物理导出独立目录"]
+    subgraph RustCore["Rust v0.7.1 三阶段解析与移植打包核心 (src-tauri/src/)"]
+        Stage1["阶段 1: 工程上下文基座 (project_db.rs)<br/>roxmltree 解析 Keil/IAR + 静态 GCC Makefile + compile_commands.json + 过滤排除编译文件"]
+        Stage2["阶段 2: AST 与多重回调基座 (c_ast.rs + callback_flow.rs)<br/>保行号 #ifdef 裁剪 + tree-sitter-c AST + 4级槽位不动点多跳异步回调缝合"]
+        Stage3["阶段 3: 可选 clangd 语义增强 (clangd_bridge.rs)<br/>临时 compile_commands.json + LSP callHierarchy 增量补全 (无 clangd 无感降级)"]
+        Exporter["图聚合与独立移植包导出器 (analyzer.rs)<br/>四层架构分类 + #include 头文件闭包 + port_adapter.c + 物理导出独立目录"]
     end
 
     DesktopApp <==>|"Tauri IPC + analysis-progress 实时进度流"| RustCore
-    Scanner --> Parser --> Linker --> Exporter
+    Stage1 --> Stage2 --> Stage3 --> Exporter
 ```
 
 ---
@@ -158,9 +159,9 @@ npm run dev
 # 2. 重新生成 Apple 银黑金属风三环拓扑多尺寸图标 (.ico / .png)
 node scripts/generateAppleLogo.mjs
 
-# 3. 编译内嵌前端资源的独立桌面版 .exe
-npx tauri build --debug --no-bundle
-Copy-Item -Force "src-tauri\target\debug\chain-analysis.exe" "ChainAnalysis_App.exe"
+# 3. 编译内嵌前端资源的 Release 独立桌面版 .exe
+npx tauri build --no-bundle
+Copy-Item -Force "src-tauri\target\release\chain-analysis.exe" "ChainAnalysis_App.exe"
 ```
 
 ---
@@ -169,8 +170,9 @@ Copy-Item -Force "src-tauri\target\debug\chain-analysis.exe" "ChainAnalysis_App.
 
 ```text
 ChainAnalysis/
-├── ChainAnalysis_App.exe              # 编译好的 Windows 原生独立桌面上位机程序（双击即用）
-├── README.md                          # 项目说明文档（本文档）
+├── ChainAnalysis_App.exe              # 编译好的 Windows 原生独立桌面上位机程序（Release 双击即用）
+├── README.md                          # 项目总览与使用文档
+├── README_zh.md                       # v0.7.1 核心解析思路、多重异步回调与三阶段架构技术文档
 ├── ARCHITECTURE_AND_PLAN.md           # 初期架构设计与四阶段规划蓝图存档
 ├── package.json                       # 前端依赖与脚本配置
 ├── vite.config.ts                     # Vite 配置与本地开发态 API 中间件
@@ -206,6 +208,10 @@ ChainAnalysis/
     ├── icons/                         # 16x16 ~ 256x256 全尺寸 Windows .ico 与 .png 图标
     └── src/
         ├── main.rs                    # Windows GUI 子系统入口（隐藏 CMD 控制台黑窗）
-        ├── lib.rs                     # Tauri 原生异步命令注册与多窗口管理
-        └── analyzer.rs                # Rust 本地 C/C++ 源码扫描、AST/栈帧解析、实时进度推送与独立移植包导出引擎
+        ├── lib.rs                     # Tauri 原生异步命令注册、clangd 探测接口与多窗口管理
+        ├── project_db.rs              # 阶段 1：Keil/IAR/Makefile/GCC/compile_commands.json 统一工程基座
+        ├── c_ast.rs                   # 阶段 2：保行号 #ifdef 裁剪 + tree-sitter-c 容错 AST 解析器
+        ├── callback_flow.rs           # 阶段 2：4 级槽位不动点传播的多重异步回调追踪引擎
+        ├── clangd_bridge.rs           # 阶段 3：可选本机 clangd LSP 语义增强桥接层（含无感降级）
+        └── analyzer.rs                # 总编排流水线、四层分类、堆栈估算、实时进度推送与独立移植包导出
 ```

@@ -1,3 +1,7 @@
+use crate::c_ast::{self, AstFunction};
+use crate::callback_flow;
+use crate::clangd_bridge::{self, ClangdStatus, QueryTargetFn};
+use crate::project_db::{self, ProjectSourceKind};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1029,6 +1033,229 @@ fn parse_c_file_functions(
     results
 }
 
+/// Convert a `tree-sitter-c` `AstFunction` into the analyzer's `ParsedFunc` representation,
+/// preserving Doxygen briefs, inline phase comments, accurate AST stack sizing, and call sites.
+fn ast_function_to_parsed_func(
+    af: &AstFunction,
+    content: &str,
+    macros: &HashMap<String, u32>,
+    is_user_src: bool,
+) -> ParsedFunc {
+    static INLINE_CMT_RE: OnceLock<Regex> = OnceLock::new();
+    let inline_cmt_re =
+        INLINE_CMT_RE.get_or_init(|| Regex::new(r"/\*+\s*(.*?)\s*\*+/").unwrap());
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start_idx = af.line_start.saturating_sub(1).min(lines.len());
+    let body_start_idx = af.body_start_line.min(lines.len());
+    let end_idx = af.line_end.saturating_sub(1).min(lines.len());
+
+    let doc_brief = extract_preceding_doc_brief(&lines, start_idx);
+    let body_lines: &[&str] = if body_start_idx < end_idx && end_idx <= lines.len() {
+        &lines[body_start_idx..end_idx]
+    } else {
+        &[]
+    };
+    let body = body_lines.join("\n");
+
+    let snippet_lines: Vec<&str> = body_lines
+        .iter()
+        .copied()
+        .filter(|l| {
+            let t = l.trim();
+            !t.is_empty() && t != "{" && t != "}"
+        })
+        .take(14)
+        .collect();
+    let snippet = if snippet_lines.is_empty() {
+        af.signature.clone()
+    } else {
+        snippet_lines.join("\n")
+    };
+
+    // Extract inline phase comments (e.g. STM32Cube `/*##-1- Configure ...*/`)
+    let mut inline_phases: Vec<InlinePhase> = Vec::new();
+    if is_user_src {
+        for b_line in body_lines {
+            if let Some(cm) = inline_cmt_re.captures(b_line) {
+                let raw_c = cm[1].trim_matches('#').trim_matches('-').trim();
+                if raw_c.len() >= 6
+                    && !raw_c.eq_ignore_ascii_case("Infinite loop")
+                    && !raw_c.contains("Error")
+                    && !raw_c.starts_with("Set the")
+                    && !raw_c.starts_with("Compare results")
+                {
+                    if b_line.contains("##-")
+                        || inline_phases.is_empty()
+                        || raw_c.starts_with("Configure")
+                        || raw_c.starts_with("Enable")
+                        || raw_c.starts_with("Compute")
+                    {
+                        inline_phases.push(InlinePhase {
+                            title: raw_c.to_string(),
+                            calls: Vec::new(),
+                            configs: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // AST-driven stack frame estimation
+    let mut local_vars = Vec::new();
+    let mut stack_warnings = Vec::new();
+    for ld in &af.local_decls {
+        if ld.is_static || is_c_keyword(&ld.name) {
+            continue;
+        }
+        if let Some(ref dim_raw) = ld.array_dim_raw {
+            let elem_sz = if ld.is_ptr {
+                4
+            } else {
+                type_size_bytes(&ld.base_type).unwrap_or(4)
+            };
+            let (count, is_vla) = if let Ok(n) = dim_raw.parse::<u32>() {
+                (n, false)
+            } else if let Some(&mval) = macros.get(dim_raw) {
+                (mval, false)
+            } else {
+                (64, true)
+            };
+            let total_bytes = (elem_sz * count).max(4);
+            let is_large = total_bytes >= 128;
+            if is_large {
+                stack_warnings.push(format!(
+                    "局部数组 {}[{}] 占用 {} Bytes 栈空间",
+                    ld.name, dim_raw, total_bytes
+                ));
+            }
+            local_vars.push(LocalVarInfo {
+                name: ld.name.clone(),
+                type_str: format!("{}[{}]", ld.base_type, dim_raw),
+                bytes: total_bytes,
+                is_array: Some(true),
+                is_vla: if is_vla { Some(true) } else { None },
+                is_large: if is_large { Some(true) } else { None },
+            });
+        } else {
+            let bytes = if ld.is_ptr {
+                4
+            } else {
+                type_size_bytes(&ld.base_type).unwrap_or(4)
+            };
+            local_vars.push(LocalVarInfo {
+                name: ld.name.clone(),
+                type_str: if ld.is_ptr {
+                    format!("{} *", ld.type_str)
+                } else {
+                    ld.type_str.clone()
+                },
+                bytes,
+                is_array: None,
+                is_vla: None,
+                is_large: None,
+            });
+        }
+    }
+
+    let is_isr = af.name.ends_with("_IRQHandler") || af.name.ends_with("_Handler");
+    let frame_overhead = if is_isr { 36 } else { 20 };
+    let vars_total: u32 = local_vars.iter().map(|v| ((v.bytes + 3) / 4) * 4).sum();
+    let stack_bytes = frame_overhead + vars_total;
+
+    // Direct calls & heap API detection
+    let mut direct_calls: Vec<CallSiteDetail> = Vec::new();
+    let mut seen_callees: HashSet<String> = HashSet::new();
+    let mut heap_apis: Vec<String> = Vec::new();
+    for dc in &af.direct_calls {
+        if is_c_keyword(&dc.callee) {
+            continue;
+        }
+        if is_heap_api(&dc.callee) && !heap_apis.contains(&dc.callee) {
+            heap_apis.push(dc.callee.clone());
+        }
+        if seen_callees.insert(dc.callee.clone()) {
+            direct_calls.push(CallSiteDetail {
+                callee: dc.callee.clone(),
+                line: dc.line,
+                args_text: dc.args_text.clone(),
+                expr: dc.expr.clone(),
+                conditions: dc.conditions.clone(),
+            });
+        }
+        if let Some(last_phase) = inline_phases.last_mut() {
+            if !is_trivial_c_std_call(&dc.callee)
+                && dc.callee != "Error_Handler"
+                && !last_phase.calls.contains(&dc.callee)
+            {
+                last_phase.calls.push(dc.callee.clone());
+            }
+        }
+    }
+
+    // Field assignments (`.field = fn`)
+    let mut field_assignments: Vec<FieldBindDetail> = Vec::new();
+    for sw in &af.slot_writes {
+        if let Some(ref fld) = sw.lhs_field {
+            if !is_c_keyword(&sw.rhs_ident) && sw.rhs_param_index.is_none() {
+                field_assignments.push(FieldBindDetail {
+                    field: fld.clone(),
+                    target_fn: sw.rhs_ident.clone(),
+                    line: sw.line,
+                    expr: sw.expr.clone(),
+                    conditions: sw.conditions.clone(),
+                });
+            }
+        }
+    }
+
+    // Struct member function-pointer calls (`recv->field()`)
+    let mut field_calls: Vec<FieldCallDetail> = Vec::new();
+    let mut seen_fcalls: HashSet<String> = HashSet::new();
+    for ic in &af.indirect_calls {
+        if let Some(ref fld) = ic.field {
+            if !ic.receiver.is_empty() && !is_c_keyword(&ic.receiver) && !is_c_keyword(fld) {
+                let key = format!("{}->{}", ic.receiver, fld);
+                if seen_fcalls.insert(key) {
+                    field_calls.push(FieldCallDetail {
+                        receiver: ic.receiver.clone(),
+                        field: fld.clone(),
+                        line: ic.line,
+                        expr: ic.expr.clone(),
+                        conditions: ic.conditions.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    ParsedFunc {
+        name: af.name.clone(),
+        signature: af.signature.clone(),
+        file: af.file.clone(),
+        line_start: af.line_start,
+        line_end: af.line_end,
+        is_weak: af.is_weak,
+        is_user_src,
+        doc_brief,
+        inline_phases,
+        config_assignments: af.config_assignments.clone(),
+        body,
+        snippet,
+        has_switch: af.has_switch,
+        switch_cases: af.switch_cases.clone(),
+        local_vars,
+        stack_bytes,
+        stack_warnings,
+        calls_heap: !heap_apis.is_empty(),
+        heap_apis,
+        direct_calls,
+        field_assignments,
+        field_calls,
+    }
+}
+
 /**
  * Parse global variables & buffers from user C files (e.g. CrypHandle, AES128Key[4], EncryptedText[4], TAG[4]).
  */
@@ -1620,9 +1847,32 @@ where
     let is_cherry_usb = root_path.join("core").join("usbd_core.c").exists()
         && root_path.join("core").join("usbh_core.c").exists();
 
+    // Stage 1: Unified Rust-native ProjectModel (compile_commands.json / Keil / IAR / Makefile)
+    let project_model = project_db::discover_project_model(root_path);
+    let root_canon = fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
+    let format_disp_path = |canon: &Path| -> String {
+        if let Ok(sub) = canon.strip_prefix(&root_canon) {
+            sub.to_string_lossy().replace('\\', "/")
+        } else if let Ok(sub) = canon.strip_prefix(root_path) {
+            sub.to_string_lossy().replace('\\', "/")
+        } else {
+            let comps: Vec<String> = canon
+                .components()
+                .rev()
+                .take(4)
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            comps.join("/")
+        }
+    };
+
     // (display_rel_path, disk_full_path, is_local_user_file)
     let mut target_files: Vec<(String, PathBuf, bool)> = Vec::new();
     let mut seen_disp = HashSet::new();
+    let mut path_to_disp: HashMap<PathBuf, String> = HashMap::new();
 
     let is_zephyr_root =
         root_path.join("west.yml").exists() && root_path.join("kernel").is_dir();
@@ -1706,7 +1956,12 @@ where
             }
         }
     } else {
-        // 1. Scan all local .c/.h files inside root_path (prioritize .c/.cpp first, skip bloat dirs)
+        let excluded_set: HashSet<PathBuf> = project_model
+            .active_target()
+            .map(|t| t.excluded_files.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // 1. Scan local .c/.h files inside root_path (skipping excluded files from IDE project)
         let mut c_files: Vec<(String, PathBuf)> = Vec::new();
         let mut h_files: Vec<(String, PathBuf)> = Vec::new();
         for (visited, entry) in WalkDir::new(root_path)
@@ -1720,20 +1975,24 @@ where
             .flatten()
             .enumerate()
         {
-            if visited > 4000 || (c_files.len() >= 60 && h_files.len() >= 30) {
+            if visited > 4000 || (c_files.len() >= 80 && h_files.len() >= 45) {
                 break;
             }
             if entry.file_type().is_file() {
                 let p = entry.path();
+                let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                if excluded_set.contains(&canon) {
+                    continue;
+                }
                 if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                     if matches!(ext, "c" | "cpp" | "h" | "hpp") {
                         if let Ok(rel) = p.strip_prefix(root_path) {
                             let disp = rel.to_string_lossy().replace('\\', "/");
                             if !is_syscall_boilerplate_file_or_fn(&disp, "") {
-                                if matches!(ext, "c" | "cpp") && c_files.len() < 60 {
-                                    c_files.push((disp, p.to_path_buf()));
-                                } else if matches!(ext, "h" | "hpp") && h_files.len() < 30 {
-                                    h_files.push((disp, p.to_path_buf()));
+                                if matches!(ext, "c" | "cpp") && c_files.len() < 80 {
+                                    c_files.push((disp, canon));
+                                } else if matches!(ext, "h" | "hpp") && h_files.len() < 45 {
+                                    h_files.push((disp, canon));
                                 }
                             }
                         }
@@ -1742,26 +2001,142 @@ where
             }
         }
         for (disp, full_path) in c_files.into_iter().chain(h_files.into_iter()) {
-            if target_files.len() >= 75 {
+            if target_files.len() >= 100 {
                 break;
             }
             if seen_disp.insert(disp.clone()) {
+                path_to_disp.insert(full_path.clone(), disp.clone());
                 target_files.push((disp, full_path, true));
             }
         }
 
-        // 2. Also discover linked SDK / HAL driver files from Keil .uvprojx / IAR .ewp!
-        on_progress(10, "正在解析 Keil/IAR 工程外部驱动引用 (.uvprojx/.ewp)...", "");
-        for (disp, full_path) in discover_ide_project_linked_files(root_path) {
-            if target_files.len() >= 160 {
-                break;
+        // 2. Load real sources & IncludePath headers from unified ProjectModel
+        //    (compile_commands.json / Keil .uvprojx / IAR .eww+.ewp / GCC Makefile)
+        if let Some(active_target) = project_model.active_target() {
+            on_progress(
+                10,
+                &format!(
+                    "已识别 {:?} 工程 [{} | {}]，正在加载源文件与 IncludePath...",
+                    project_model.source_kind,
+                    active_target.name,
+                    active_target.compiler_flavor.as_str()
+                ),
+                "",
+            );
+
+            // 2a. Target sources (.c/.cpp/.h/.hpp)
+            let mut target_c_paths: Vec<PathBuf> = Vec::new();
+            for src_path in &active_target.sources {
+                if target_files.len() >= 220 {
+                    break;
+                }
+                let ext = src_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(ext.as_str(), "c" | "cpp" | "cc" | "cxx" | "h" | "hpp") {
+                    if matches!(ext.as_str(), "c" | "cpp" | "cc" | "cxx") {
+                        target_c_paths.push(src_path.clone());
+                    }
+                    let disp = format_disp_path(src_path);
+                    if !is_syscall_boilerplate_file_or_fn(&disp, "")
+                        && seen_disp.insert(disp.clone())
+                    {
+                        let is_local = src_path.starts_with(&root_canon)
+                            && !disp.starts_with("Drivers/")
+                            && !disp.contains("Libraries/");
+                        path_to_disp.insert(src_path.clone(), disp.clone());
+                        target_files.push((disp, src_path.clone(), is_local));
+                    }
+                }
             }
-            if (disp.ends_with(".c") || disp.ends_with(".h"))
-                && !is_syscall_boilerplate_file_or_fn(&disp, "")
-                && seen_disp.insert(disp.clone())
-            {
-                let is_local = !disp.starts_with("Drivers/") && !disp.contains("Libraries/");
-                target_files.push((disp, full_path, is_local));
+
+            // 2b. Companion headers next to target .c files & real IncludePath directories
+            let mut inc_dirs_to_scan: Vec<PathBuf> = active_target.include_dirs.clone();
+            for c_path in &target_c_paths {
+                if let Some(c_dir) = c_path.parent() {
+                    let stem = c_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if !stem.is_empty() {
+                        let same_h = c_dir.join(format!("{}.h", stem));
+                        if let Ok(hc) = fs::canonicalize(&same_h) {
+                            let disp = format_disp_path(&hc);
+                            if seen_disp.insert(disp.clone()) {
+                                path_to_disp.insert(hc.clone(), disp.clone());
+                                target_files.push((disp, hc, false));
+                            }
+                        }
+                    }
+                    if let Some(parent_dir) = c_dir.parent() {
+                        for inc_name in ["inc", "Inc", "include"] {
+                            let d = parent_dir.join(inc_name);
+                            if d.is_dir() {
+                                if let Ok(dc) = fs::canonicalize(&d) {
+                                    if !inc_dirs_to_scan.contains(&dc) {
+                                        inc_dirs_to_scan.push(dc);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut scanned_inc_dirs: HashSet<PathBuf> = HashSet::new();
+            for inc_dir in inc_dirs_to_scan {
+                if target_files.len() >= 240 {
+                    break;
+                }
+                if !scanned_inc_dirs.insert(inc_dir.clone()) {
+                    continue;
+                }
+                if let Ok(rd) = fs::read_dir(&inc_dir) {
+                    let mut hdrs: Vec<PathBuf> = rd
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|hp| {
+                            hp.is_file()
+                                && matches!(
+                                    hp.extension().and_then(|s| s.to_str()),
+                                    Some("h" | "hpp")
+                                )
+                        })
+                        .collect();
+                    hdrs.sort();
+                    // Load up to 24 headers per include dir so ops-tables & macros are captured without flooding
+                    for hp in hdrs.into_iter().take(24) {
+                        if target_files.len() >= 240 {
+                            break;
+                        }
+                        if let Ok(hc) = fs::canonicalize(&hp) {
+                            let disp = format_disp_path(&hc);
+                            if !is_syscall_boilerplate_file_or_fn(&disp, "")
+                                && seen_disp.insert(disp.clone())
+                            {
+                                let is_local = hc.starts_with(&root_canon)
+                                    && !disp.starts_with("Drivers/")
+                                    && !disp.contains("Libraries/");
+                                path_to_disp.insert(hc.clone(), disp.clone());
+                                target_files.push((disp, hc, is_local));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback legacy scanner if ProjectModel had no active target
+            for (disp, full_path) in discover_ide_project_linked_files(root_path) {
+                if target_files.len() >= 180 {
+                    break;
+                }
+                if (disp.ends_with(".c") || disp.ends_with(".h"))
+                    && !is_syscall_boilerplate_file_or_fn(&disp, "")
+                    && seen_disp.insert(disp.clone())
+                {
+                    let is_local = !disp.starts_with("Drivers/") && !disp.contains("Libraries/");
+                    path_to_disp.insert(full_path.clone(), disp.clone());
+                    target_files.push((disp, full_path, is_local));
+                }
             }
         }
     }
@@ -1826,6 +2201,39 @@ where
     let def_re = Regex::new(r"#define\s+([A-Z0-9_]+)\s+(0x[0-9a-fA-F]+|\d+)\b").unwrap();
     let mut config_macros_vec: Vec<Value> = Vec::new();
 
+    // Inject build-target <Define> / -D macros from ProjectModel into macros & config_macros_vec
+    if let Some(active_target) = project_model.active_target() {
+        let proj_file_label = active_target
+            .project_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Project Config");
+        for (k, v_opt) in &active_target.defines {
+            if let Some(raw_v) = v_opt {
+                let parsed_num = if let Some(hex) = raw_v
+                    .strip_prefix("0x")
+                    .or_else(|| raw_v.strip_prefix("0X"))
+                {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    raw_v.parse::<u32>().ok()
+                };
+                if let Some(num) = parsed_num {
+                    macros.insert(k.clone(), num);
+                }
+            }
+            if config_macros_vec.len() < 16 {
+                config_macros_vec.push(json!({
+                    "name": k,
+                    "defaultVal": v_opt.as_deref().unwrap_or("1"),
+                    "file": proj_file_label,
+                    "purpose": format!("工程构建宏 ({} / {})", active_target.name, active_target.compiler_flavor.as_str())
+                }));
+            }
+        }
+    }
+
     let total_files = target_files.len().max(1);
     for (idx, (disp, full_path, is_local)) in target_files.iter().enumerate() {
         let pct = 14 + ((idx * 24) / total_files) as u32;
@@ -1875,31 +2283,93 @@ where
         }
     }
     let inc_re = Regex::new(r#"#include\s+["<]([^">]+)[">]"#).unwrap();
+    let active_include_dirs: Vec<PathBuf> = project_model
+        .active_target()
+        .map(|t| t.include_dirs.clone())
+        .unwrap_or_default();
+    let disp_to_path: HashMap<String, PathBuf> = target_files
+        .iter()
+        .map(|(d, p, _)| (d.clone(), p.clone()))
+        .collect();
     let mut file_includes: HashMap<String, Vec<String>> = HashMap::new();
     for (rel, content) in &files_content {
         let mut incs = Vec::new();
+        let cur_dir = disp_to_path.get(rel).and_then(|p| p.parent());
         for caps in inc_re.captures_iter(content) {
             let raw_inc = caps[1].replace('\\', "/");
-            if files_content.contains_key(&raw_inc) {
-                if !incs.contains(&raw_inc) {
-                    incs.push(raw_inc);
-                }
-            } else if let Some(base) = Path::new(&raw_inc).file_name().and_then(|s| s.to_str()) {
-                if let Some(mapped) = header_by_base.get(base) {
-                    if !incs.contains(mapped) {
-                        incs.push(mapped.clone());
+            let mut resolved_disp: Option<String> = None;
+            // 1. Direct relative to current file directory
+            if let Some(cd) = cur_dir {
+                if let Ok(canon) = fs::canonicalize(cd.join(&raw_inc)) {
+                    if let Some(d) = path_to_disp.get(&canon) {
+                        resolved_disp = Some(d.clone());
                     }
+                }
+            }
+            // 2. Search declared IncludePath directories from ProjectModel
+            if resolved_disp.is_none() {
+                for inc_dir in &active_include_dirs {
+                    if let Ok(canon) = fs::canonicalize(inc_dir.join(&raw_inc)) {
+                        if let Some(d) = path_to_disp.get(&canon) {
+                            resolved_disp = Some(d.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            // 3. Fallback to exact display path or header basename
+            if resolved_disp.is_none() {
+                if files_content.contains_key(&raw_inc) {
+                    resolved_disp = Some(raw_inc);
+                } else if let Some(base) = Path::new(&raw_inc).file_name().and_then(|s| s.to_str()) {
+                    if let Some(mapped) = header_by_base.get(base) {
+                        resolved_disp = Some(mapped.clone());
+                    }
+                }
+            }
+            if let Some(d) = resolved_disp {
+                if !incs.contains(&d) {
+                    incs.push(d);
                 }
             }
         }
         file_includes.insert(rel.clone(), incs);
     }
 
-    // Parse all functions and global variables
+    // Stage 2: Build active preprocessor define map (ProjectModel <Define>/-D + loaded header #define)
+    // and collect global variable types via tree-sitter-c AST for slot resolution.
+    let mut known_defines: HashMap<String, Option<String>> = HashMap::new();
+    if let Some(active_target) = project_model.active_target() {
+        for (k, v) in &active_target.defines {
+            known_defines.insert(k.clone(), v.clone());
+        }
+    }
+    let any_def_re = Regex::new(r"(?m)^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(?:[ \t]+([^\r\n/]+))?").unwrap();
+    let mut global_var_types: HashMap<String, String> = HashMap::new();
+    for (rel, content) in &files_content {
+        if rel.ends_with(".h") || rel.ends_with(".hpp") {
+            for caps in any_def_re.captures_iter(content) {
+                let m_name = caps[1].to_string();
+                let m_val = caps.get(2).map(|m| m.as_str().trim().to_string()).filter(|s| !s.is_empty());
+                known_defines.entry(m_name).or_insert(m_val);
+            }
+        }
+        for (vname, vtype) in c_ast::extract_var_types_ast(content) {
+            global_var_types.entry(vname).or_insert(vtype);
+        }
+    }
+    let has_project_defines = project_model
+        .active_target()
+        .map(|t| !t.defines.is_empty())
+        .unwrap_or(false);
+
+    // Parse all functions and global variables via Stage 2 tree-sitter-c AST (+ #ifdef pruning)
     let mut parsed_funcs: HashMap<String, ParsedFunc> = HashMap::new();
+    let mut ast_funcs_map: HashMap<String, AstFunction> = HashMap::new();
     let mut weak_names: HashSet<String> = HashSet::new();
     let mut globals_vec: Vec<Value> = Vec::new();
     let mut global_names: Vec<String> = Vec::new();
+    let mut total_pruned_ifdef_lines: usize = 0;
 
     for (idx, (disp, _, is_local)) in target_files.iter().enumerate() {
         if !disp.ends_with(".c") && !disp.ends_with(".cpp") {
@@ -1908,12 +2378,16 @@ where
         let pct = 44 + ((idx * 36) / total_files) as u32;
         on_progress(
             pct,
-            &format!("正在解析 AST 函数、Doxygen注释与栈帧 ({}/{})", idx + 1, total_files),
+            &format!("正在解析 tree-sitter AST 函数、#ifdef 裁剪与栈帧 ({}/{})", idx + 1, total_files),
             disp,
         );
         if let Some(content) = files_content.get(disp) {
+            let (pruned_content, pruned_cnt) =
+                c_ast::prune_inactive_ifdefs(content, &known_defines, has_project_defines);
+            total_pruned_ifdef_lines += pruned_cnt;
+
             if *is_local && !is_cherry_usb {
-                for g in parse_global_variables(disp, content, &macros) {
+                for g in parse_global_variables(disp, &pruned_content, &macros) {
                     if let Some(gn) = g.get("name").and_then(|v| v.as_str()) {
                         if !global_names.contains(&gn.to_string()) {
                             global_names.push(gn.to_string());
@@ -1923,30 +2397,63 @@ where
                 }
             }
 
-            for pf in parse_c_file_functions(disp, content, &macros, *is_local) {
-                if is_syscall_boilerplate_file_or_fn(disp, &pf.name) {
-                    continue;
-                }
-                if pf.is_weak {
-                    weak_names.insert(pf.name.clone());
-                }
-                let replace = match parsed_funcs.get(&pf.name) {
-                    None => true,
-                    Some(ex) => {
-                        if ex.file.starts_with("port/fsdev/") && disp.starts_with("port/dwc2/") {
-                            false
-                        } else if ex.file == "demo/cdc_acm_template.c" && disp.starts_with("demo/")
-                        {
-                            false
-                        } else if ex.is_user_src && !pf.is_user_src {
-                            false
-                        } else {
-                            (ex.is_weak && !pf.is_weak) || (!ex.is_user_src && pf.is_user_src)
-                        }
+            let ast_list = c_ast::parse_c_file_ast(disp, &pruned_content, &global_var_types);
+            if !ast_list.is_empty() {
+                for af in ast_list {
+                    if is_syscall_boilerplate_file_or_fn(disp, &af.name) {
+                        continue;
                     }
-                };
-                if replace {
-                    parsed_funcs.insert(pf.name.clone(), pf);
+                    let pf = ast_function_to_parsed_func(&af, &pruned_content, &macros, *is_local);
+                    if pf.is_weak {
+                        weak_names.insert(pf.name.clone());
+                    }
+                    let replace = match parsed_funcs.get(&pf.name) {
+                        None => true,
+                        Some(ex) => {
+                            if ex.file.starts_with("port/fsdev/") && disp.starts_with("port/dwc2/") {
+                                false
+                            } else if ex.file == "demo/cdc_acm_template.c" && disp.starts_with("demo/")
+                            {
+                                false
+                            } else if ex.is_user_src && !pf.is_user_src {
+                                false
+                            } else {
+                                (ex.is_weak && !pf.is_weak) || (!ex.is_user_src && pf.is_user_src)
+                            }
+                        }
+                    };
+                    if replace {
+                        ast_funcs_map.insert(pf.name.clone(), af);
+                        parsed_funcs.insert(pf.name.clone(), pf);
+                    }
+                }
+            } else {
+                // Fallback to legacy regex scanner if tree-sitter found 0 functions (e.g. extreme macro wrappers)
+                for pf in parse_c_file_functions(disp, &pruned_content, &macros, *is_local) {
+                    if is_syscall_boilerplate_file_or_fn(disp, &pf.name) {
+                        continue;
+                    }
+                    if pf.is_weak {
+                        weak_names.insert(pf.name.clone());
+                    }
+                    let replace = match parsed_funcs.get(&pf.name) {
+                        None => true,
+                        Some(ex) => {
+                            if ex.file.starts_with("port/fsdev/") && disp.starts_with("port/dwc2/") {
+                                false
+                            } else if ex.file == "demo/cdc_acm_template.c" && disp.starts_with("demo/")
+                            {
+                                false
+                            } else if ex.is_user_src && !pf.is_user_src {
+                                false
+                            } else {
+                                (ex.is_weak && !pf.is_weak) || (!ex.is_user_src && pf.is_user_src)
+                            }
+                        }
+                    };
+                    if replace {
+                        parsed_funcs.insert(pf.name.clone(), pf);
+                    }
                 }
             }
         }
@@ -1954,7 +2461,7 @@ where
 
     on_progress(
         84,
-        &format!("正在缝合调用链与隐式回调 ({} 个函数)...", parsed_funcs.len()),
+        &format!("正在缝合调用链与多重异步回调 ({} 个函数)...", parsed_funcs.len()),
         "",
     );
 
@@ -2243,6 +2750,27 @@ where
         }
     }
 
+    // Stage 2: Fixed-point Multi-Hop Async Callback Solver
+    // Resolves multi-layer wrapper registrations (A -> B -> C -> slot), config-struct slot copies
+    // (ep->ep_cb -> rx_msg[ep].cb), and nested/chained async callbacks (CB1 registers CB2).
+    let known_func_names: HashSet<String> = parsed_funcs.keys().cloned().collect();
+    let resolved_async_edges =
+        callback_flow::solve_multi_hop_callbacks(&ast_funcs_map, &known_func_names);
+    let resolved_async_count = resolved_async_edges.len();
+    for ae in resolved_async_edges {
+        push_edge(
+            &ae.source_fn,
+            &ae.target_fn,
+            "ASYNC_CALLBACK",
+            "INVOKE_CB",
+            Some(ae.label),
+            Some(ae.registered_at),
+            ae.call_site_line,
+            Some(ae.call_site_expr),
+            ae.conditions,
+        );
+    }
+
     if is_cherry_usb {
         let curated = [
             ("usbd_desc_register", "device_descriptor_callback", "OPS_TABLE", "BIND", "descriptors->device_descriptor_callback"),
@@ -2259,6 +2787,70 @@ where
         ];
         for (s, t, k, rt, lbl) in curated {
             push_edge(s, t, k, rt, Some(lbl.to_string()), None, 1, Some(lbl.to_string()), Vec::new());
+        }
+    }
+
+    drop(push_edge);
+
+    // Stage 3: Optional `clangd` LSP Semantic Enhancement (graceful fallback when unavailable)
+    let clangd_report = if project_model.source_kind != ProjectSourceKind::DirectoryFallback {
+        let mut query_targets: Vec<QueryTargetFn> = Vec::new();
+        for pf in parsed_funcs.values().filter(|f| f.is_user_src) {
+            if let Some(disk_path) = disp_to_path.get(&pf.file) {
+                let name_col = files_content
+                    .get(&pf.file)
+                    .and_then(|c| c.lines().nth(pf.line_start.saturating_sub(1)))
+                    .and_then(|l| l.find(&pf.name))
+                    .unwrap_or(0);
+                query_targets.push(QueryTargetFn {
+                    name: pf.name.clone(),
+                    disk_path: disk_path.clone(),
+                    line_start: pf.line_start,
+                    name_col,
+                });
+            }
+        }
+        clangd_bridge::enhance_graph_with_clangd(
+            &project_model,
+            &query_targets,
+            &known_func_names,
+            &edge_keys,
+            None,
+        )
+    } else {
+        clangd_bridge::ClangdReport {
+            status: ClangdStatus::Unavailable,
+            binary_path: clangd_bridge::detect_clangd_binary(None)
+                .map(|p| p.to_string_lossy().replace('\\', "/")),
+            temp_cdb_dir: None,
+            added_edges: Vec::new(),
+            queried_functions: 0,
+            elapsed_ms: 0,
+            message: "纯目录模式未提供工程构建配置，已直接采用阶段 2 tree-sitter-c AST 引擎".to_string(),
+        }
+    };
+    let mut clangd_added_count = 0usize;
+    for ce in &clangd_report.added_edges {
+        let k = format!("{}->{}", ce.source_fn, ce.target_fn);
+        if ce.source_fn != ce.target_fn
+            && nodes_map.contains_key(&ce.source_fn)
+            && nodes_map.contains_key(&ce.target_fn)
+            && edge_keys.insert(k)
+        {
+            edges_vec.push(json!({
+                "id": format!("e_rs_{}", edge_seq),
+                "source": ce.source_fn,
+                "target": ce.target_fn,
+                "kind": "DIRECT",
+                "relationType": "CALL",
+                "label": ce.label,
+                "registeredAt": "clangd LSP callHierarchy",
+                "callSiteLine": ce.call_site_line,
+                "callSiteExpr": format!("{}() [clangd]", ce.target_fn),
+                "conditions": Value::Null,
+            }));
+            edge_seq += 1;
+            clangd_added_count += 1;
         }
     }
 
@@ -2816,11 +3408,39 @@ where
         .and_then(|s| s.to_str())
         .unwrap_or("Embedded_Project");
 
+    let engine_label = match clangd_report.status {
+        ClangdStatus::Active => {
+            "Stage 1 ProjectModel + Stage 2 tree-sitter-c AST/Multi-Hop + Stage 3 clangd LSP (Active)"
+        }
+        ClangdStatus::Unavailable | ClangdStatus::Fallback => {
+            "Stage 1 ProjectModel + Stage 2 tree-sitter-c AST/Multi-Hop (clangd Fallback)"
+        }
+    };
+
+    let project_meta = json!({
+        "sourceKind": project_model.source_kind,
+        "parserEngine": engine_label,
+        "activeTarget": project_model.active_target().map(|t| t.name.clone()),
+        "compilerFlavor": project_model.active_target().map(|t| t.compiler_flavor.as_str()).unwrap_or("Unknown"),
+        "availableTargets": project_model.targets.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        "includeDirsCount": project_model.active_target().map(|t| t.include_dirs.len()).unwrap_or(0),
+        "definesCount": project_model.active_target().map(|t| t.defines.len()).unwrap_or(0),
+        "excludedFilesCount": project_model.active_target().map(|t| t.excluded_files.len()).unwrap_or(0),
+        "prunedIfdefLines": total_pruned_ifdef_lines,
+        "resolvedAsyncCallbacks": resolved_async_count,
+        "clangdStatus": clangd_report.status,
+        "clangdBinary": clangd_report.binary_path,
+        "clangdAddedEdges": clangd_added_count,
+        "clangdMessage": clangd_report.message,
+        "hasProjectModel": project_model.source_kind != ProjectSourceKind::DirectoryFallback,
+    });
+
     Ok(json!({
         "projectName": proj_name,
         "archBits": 32,
         "targetMcuHint": format!("Real Local Repo ({})", root_dir),
         "sourceKind": "LOCAL_WORKSPACE",
+        "projectMeta": project_meta,
         "runtimeParadigm": if is_zephyr_root { "RTOS" } else if is_cherry_usb { "HYBRID_OPTIONAL_OS" } else { "BARE_METAL" },
         "detectedMspStackBytes": detected_msp_stack_bytes,
         "mspStackSource": msp_stack_source,
@@ -2958,5 +3578,143 @@ mod tests {
             edges.iter().any(|e| e["source"] == "USBH_Process" && e["target"] == "USBH_HID_Handle"),
             "USBH_Process -> USBH_HID_Handle INVOKE_CB edge must exist!"
         );
+    }
+
+    #[test]
+    fn test_stage2_ast_ifdef_and_multihop_async_callbacks_e2e() {
+        let dir = std::env::temp_dir()
+            .join("chain_analysis_stage2_e2e")
+            .join("multihop_demo");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("MDK-ARM")).unwrap();
+        fs::create_dir_all(dir.join("Core/Src")).unwrap();
+        fs::create_dir_all(dir.join("Core/Inc")).unwrap();
+
+        let uvprojx = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Project>
+  <Targets>
+    <Target>
+      <TargetName>DMA_Target</TargetName>
+      <TargetOption>
+        <TargetCommonOption><uAC6>1</uAC6></TargetCommonOption>
+        <TargetArmAds>
+          <Cads>
+            <VariousControls>
+              <Define>USE_DMA_MODE, STM32F407xx</Define>
+              <IncludePath>..\Core\Inc</IncludePath>
+            </VariousControls>
+          </Cads>
+        </TargetArmAds>
+      </TargetOption>
+      <Groups>
+        <Group>
+          <GroupName>Core</GroupName>
+          <Files>
+            <File><FilePath>..\Core\Src\app.c</FilePath></File>
+          </Files>
+        </Group>
+      </Groups>
+    </Target>
+  </Targets>
+</Project>"#;
+        fs::write(dir.join("MDK-ARM/demo.uvprojx"), uvprojx).unwrap();
+
+        let hdr = r#"
+typedef void (*uart_cb_t)(int status);
+typedef struct {
+    uart_cb_t rx_cb;
+    uart_cb_t tx_cb;
+} uart_bus_t;
+"#;
+        fs::write(dir.join("Core/Inc/uart_bus.h"), hdr).unwrap();
+
+        let app_c = r#"#include "uart_bus.h"
+
+static uart_bus_t g_bus;
+
+#ifdef USE_DMA_MODE
+void dma_ll_bind_rx(uart_cb_t cb) {
+    g_bus.rx_cb = cb;
+}
+#else
+void polling_fallback_unused(void) {}
+#endif
+
+void dma_ll_bind_tx(uart_cb_t cb) {
+    g_bus.tx_cb = cb;
+}
+
+void drv_register_rx(int ch, uart_cb_t cb) {
+    (void)ch;
+    dma_ll_bind_rx(cb);
+}
+
+void app_stage2_tx_complete(int status) {
+    (void)status;
+}
+
+void app_stage1_rx_complete(int status) {
+    if (status == 0) {
+        dma_ll_bind_tx(app_stage2_tx_complete);
+    }
+}
+
+void DMA1_Stream0_IRQHandler(void) {
+    if (g_bus.rx_cb) {
+        g_bus.rx_cb(0);
+    }
+}
+
+void USART1_IRQHandler(void) {
+    if (g_bus.tx_cb) {
+        g_bus.tx_cb(1);
+    }
+}
+
+int main(void) {
+    drv_register_rx(1, app_stage1_rx_complete);
+    return 0;
+}
+"#;
+        fs::write(dir.join("Core/Src/app.c"), app_c).unwrap();
+
+        let res = analyze_local_c_project_with_progress(dir.to_str().unwrap(), |_, _, _| {})
+            .expect("e2e stage2 failed");
+        let nodes = res["nodes"].as_object().unwrap();
+        let edges = res["edges"].as_array().unwrap();
+
+        // #ifdef USE_DMA_MODE kept active branch and pruned dead #else branch!
+        assert!(nodes.contains_key("dma_ll_bind_rx"));
+        assert!(!nodes.contains_key("polling_fallback_unused"));
+
+        // 3-hop async callback: main -> drv_register_rx -> dma_ll_bind_rx -> g_bus.rx_cb -> DMA1_Stream0_IRQHandler
+        let hop1 = edges
+            .iter()
+            .find(|e| {
+                e["source"] == "DMA1_Stream0_IRQHandler"
+                    && e["target"] == "app_stage1_rx_complete"
+                    && e["relationType"] == "INVOKE_CB"
+            })
+            .expect("Stage-1 multi-hop INVOKE_CB edge missing");
+        assert!(hop1["registeredAt"]
+            .as_str()
+            .unwrap_or("")
+            .contains("main -> drv_register_rx -> dma_ll_bind_rx"));
+
+        // Nested Stage-2 async callback registered inside Stage-1 callback!
+        let hop2 = edges
+            .iter()
+            .find(|e| {
+                e["source"] == "USART1_IRQHandler"
+                    && e["target"] == "app_stage2_tx_complete"
+                    && e["relationType"] == "INVOKE_CB"
+            })
+            .expect("Stage-2 nested INVOKE_CB edge missing");
+        assert!(hop2["registeredAt"]
+            .as_str()
+            .unwrap_or("")
+            .contains("app_stage1_rx_complete -> dma_ll_bind_tx"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
